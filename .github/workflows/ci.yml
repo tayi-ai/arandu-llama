@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # API compatibility is measured against the latest immutable tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          # Not go-version-file: go.mod declares the MINIMUM language version,
+          # and setup-go would install exactly that -- a patch release whose
+          # standard library carries fixed vulnerabilities. "stable" is the
+          # version people actually run, which is what CI should test against.
+          go-version: stable
+
+      - name: gofmt
+        # Two filters, and neither is preference. gofmt is the only tool in the
+        # chain that ignores build tags, so it reads files the compiler
+        # deliberately excludes; testdata/ holds fixtures that are invalid on
+        # purpose. `go build`, `go vet` and `go test` skip both on their own.
+        run: |
+          unformatted=$(find . -name '*.go' -not -path '*/testdata/*' \
+                          -not -name '*.kyse.go' -exec gofmt -l {} +)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -race ./...
+
+      # A v0 release may break, but every break must tell an installer exactly
+      # what to replace. Module mode also sees a deleted package or type that a
+      # loop over the current package list would miss.
+      - name: api diff against the last release
+        run: |
+          set -euo pipefail
+          modpath=$(GOWORK=off go list -m -f '{{.Path}}')
+          latest=""
+          while IFS= read -r tag; do
+            tagged_module=$(git show "${tag}:go.mod" | sed -n 's/^module //p')
+            if [ "$tagged_module" = "$modpath" ]; then
+              latest="$tag"
+              break
+            fi
+          done < <(git tag --list 'v*' --sort=-v:refname)
+          if [ -z "$latest" ]; then
+            echo "no release to compare against yet"
+            exit 0
+          fi
+          echo "comparing the working tree against $latest"
+
+          tmp=$(mktemp -d)
+          old="$tmp/last-release"
+          git worktree add -q --detach "$old" "$latest"
+          (cd "$old" && GOWORK=off go run golang.org/x/exp/cmd/apidiff@latest -m -w "$tmp/api.out" "$modpath")
+          git worktree remove --force "$old"
+
+          GOWORK=off go run golang.org/x/exp/cmd/apidiff@latest -m -incompatible "$tmp/api.out" "$modpath" > "$tmp/diff.out"
+          broke=$(grep '^- ' "$tmp/diff.out" || true)
+          if [ -z "$broke" ]; then
+            echo "no incompatible change since $latest"
+            exit 0
+          fi
+          while IFS= read -r line; do
+            printf '    %s\n' "$line"
+          done <<< "$broke"
+
+          if git diff --quiet "$latest" -- UPGRADE.md; then
+            echo
+            echo "there are incompatible changes and UPGRADE.md was not touched since $latest."
+            exit 1
+          fi
+
+          added=$(git diff "$latest" -- UPGRADE.md | grep '^+' || true)
+          missing=0
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            symbol=${line#- }
+            symbol=${symbol#package }
+            symbol=${symbol#./}
+            symbol=${symbol%%:*}
+            [ -n "$symbol" ] || continue
+            if ! printf '%s' "$added" | grep -qF -- "$symbol"; then
+              echo "UPGRADE.md does not name $symbol"
+              missing=1
+            fi
+          done <<< "$broke"
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "every incompatible change is named in UPGRADE.md"
+
+      # Required by doc 24: a known vulnerability blocks the merge rather than
+      # showing up in a report nobody reads.
+      #
+      # It is outside the template markers on purpose, so it survives configure:
+      # a package cloned from here inherits the check, which is the whole reason
+      # a llama carries CI at all.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+

@@ -1,0 +1,30 @@
+# What this package declares about itself.
+#
+# The declaration is capability, not intent, and `aru doctor` compares it with
+# what the code imports and calls. A package that says it makes no outbound
+# calls and then holds an HTTP client is rejected, which is what makes the
+# four lines below worth reading before installing anything.
+
+name = "tayi-ai/llama"
+framework = ">= 0.46"
+profiles = ["conventional", "performance"]
+
+[permissions]
+# It answers requests and reads its own rows. Nothing leaves the process: the
+# engine that holds the weights is passed in, and reaching it is the caller's
+# capability rather than this package's.
+network = false
+# It reads model files, adapter files and their digests from disk. That is what
+# an inference engine is, and the audit caught this declaration saying otherwise:
+# the wrapper this package replaced held no weights and could say false, and this
+# one loads gigabytes of them.
+filesystem = true
+# It runs no other program. It does link one: llama.cpp, through cgo, with the
+# CUDA kernels for the cards it was built for. That is not exec and the manifest
+# has no key for it, so it is said here instead -- an application registering this
+# module builds with CGO_ENABLED=1 and links a C++ library, and there is no build
+# tag that makes that optional.
+exec = false
+# module.go owns the llamas table, so whoever installs this has to run
+# `aru migrate`. Declaring it is how they find that out before deploying.
+migrations = true

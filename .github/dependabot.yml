@@ -1,0 +1,25 @@
+# Two ecosystems, because those are the two this repository has: the Go module
+# graph and the actions the workflow pins. There is no npm entry and there will
+# not be one -- nothing here installs Node.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5
+    groups:
+      gomod:
+        patterns:
+          - "*"
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

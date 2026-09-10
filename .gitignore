@@ -1,0 +1,31 @@
+# build files
+/binding.o
+/build
+/ggml-metal.metal
+prepare
+# *.o rather than the two names: wrapper_adapter.o was added here and was not
+# ignored, so it showed up untracked in every status and was one `git add -A`
+# away from being committed. A new translation unit should not have to remember
+# to edit this file.
+*.o
+cgo_headers/.vendored
+
+# build artefacts (static and shared)
+lib*.a
+lib*.so
+lib*.so.*
+lib*.dylib
+
+# build output directories
+/build-output
+
+# just in case
+.DS_Store
+.idea
+.vscode
+Thumbs.db
+CLAUDE.md
+
+# local testing files
+ggllm-test-model.bin
+*.gguf
