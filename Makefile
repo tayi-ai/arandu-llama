@@ -293,10 +293,17 @@ llama.cpp/sampling.o: llama.cpp/ggml.o
 llama.cpp/log.o: llama.cpp/ggml.o
 	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include llama.cpp/common/log.cpp -o llama.cpp/log.o -c $(LDFLAGS)
 
-wrapper.o:
+# The sources are prerequisites, which they were not.
+#
+# Without them make sees a target whose file exists and nothing it depends on,
+# calls it up to date, and skips the compile -- so an edit to wrapper.cpp
+# produced a `make` that printed nothing, exited zero, and relinked the object
+# from before the edit. It cost a round of "the fix did not take" before the
+# timestamp on libbinding.a gave it away.
+wrapper.o: wrapper.cpp wrapper.h
 	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include wrapper.cpp -o wrapper.o -c $(LDFLAGS)
 
-wrapper_adapter.o:
+wrapper_adapter.o: wrapper_adapter.cpp wrapper.h
 	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include wrapper_adapter.cpp -o wrapper_adapter.o -c $(LDFLAGS)
 
 # Vendored llama.cpp headers. Consumers fetching this repo through the Go module

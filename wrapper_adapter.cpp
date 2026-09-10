@@ -349,8 +349,25 @@ int llama_wrapper_score(void* ctx, const int* tokens, int n_tokens, int n_skip,
             if (threads > 1) {
                 std::vector<std::thread> workers;
                 workers.reserve(threads);
-                for (unsigned t = 0; t < threads; t++) workers.emplace_back(compute);
-                for (auto& worker : workers) worker.join();
+                // A thread that cannot be created throws, and a vector of
+                // joinable threads destroyed by the unwinding calls
+                // std::terminate -- the process aborts, in the middle of a
+                // measurement, with no error a caller could report. Under memory
+                // pressure on a shared card that is a real failure and not a
+                // theoretical one.
+                //
+                // Whatever was created is joined, and the remainder is computed
+                // on this thread. Fewer workers is slower; aborting is not.
+                try {
+                    for (unsigned t = 0; t < threads; t++) workers.emplace_back(compute);
+                } catch (const std::exception&) {
+                }
+                if (workers.empty()) {
+                    compute();
+                } else {
+                    compute();
+                    for (auto& worker : workers) worker.join();
+                }
             } else if (!work.empty()) {
                 compute();
             }
