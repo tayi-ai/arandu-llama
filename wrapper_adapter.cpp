@@ -404,3 +404,230 @@ int llama_wrapper_score(void* ctx, const int* tokens, int n_tokens, int n_skip,
 }
 
 }  // extern "C"
+
+// Restores the embeddings flag on every exit path, exceptions included.
+//
+// A capture switches the flag on for its decode. A context left in embeddings
+// mode would flag every row of the next score and reserve an embeddings buffer
+// nobody reads, and a context created for embeddings would stop producing them
+// if the flag were left off. So the creation value is put back before anything
+// else happens on the context, whichever way the capture ends.
+namespace {
+struct embeddings_guard {
+    llama_context* ctx;
+    bool after;
+    ~embeddings_guard() { llama_set_embeddings(ctx, after); }
+};
+}  // namespace
+
+extern "C" {
+
+int llama_wrapper_model_n_embd_out(void* model) {
+    if (!model) {
+        g_last_error = "Model cannot be null";
+        return -1;
+    }
+    // Reads only ->model, the first member of both handle definitions.
+    auto wrapper = static_cast<llama_wrapper_model_t*>(model);
+    return static_cast<int>(llama_model_n_embd_out(wrapper->model));
+}
+
+// llama_wrapper_capture_final reads the per-token final representation of a
+// token sequence: the hidden state after the final RMS normalisation and before
+// the output projection.
+//
+// At the pinned llama.cpp commit that is the graph node named "result_norm"
+// (src/models/smollm3.cpp, `cb(cur, "result_norm", -1); res->t_embd = cur;`).
+// It is not observed through a scheduler callback. llama.cpp already copies
+// exactly that tensor into the context's embeddings buffer when
+// cparams.embeddings is on and the pooling type is NONE, so the flag is
+// switched on for this decode and read back with llama_get_embeddings_ith.
+// Measured bitwise equal to the tensor seen through cb_eval, 14/14 rows,
+// max|diff| = 0, on SmolLM3-3B Q4_K_M on CPU. A callback would have had to be
+// installed at context creation, and once installed it synchronises every
+// split of every decode on that context for the rest of its life.
+//
+// Every row of every window is flagged as an output. In embeddings mode the
+// batch allocator overrides a partial selection to all rows anyway
+// (src/llama-batch.cpp, "embeddings required but some input tokens were not
+// marked as outputs -> overriding"), and the choice is not free of consequence:
+// a decode that flags a subset of rows runs the last layer's FFN over a
+// different number of rows, and its values differ from the full-window rows by
+// up to 1.9e-6 (measured, rows 3 and 7 of a 14-token sequence). The rule is
+// therefore part of the capture version, and the positions decide only which
+// rows are copied out.
+//
+// The window is bounded exactly as the scoring window is, because logits are
+// reserved per output row in embeddings mode too (has_logits is unconditional
+// in output_reserve), and the second bound is the same GGML_ASSERT.
+int llama_wrapper_capture_final(void* ctx, const int* tokens, int n_tokens,
+                                const int* positions, int n_positions,
+                                bool embeddings_after,
+                                float* out, long long out_floats) {
+    if (!ctx || !tokens || !positions || !out) {
+        g_last_error = "Context, tokens, positions and an output buffer are required";
+        return -1;
+    }
+    if (n_tokens < 1) {
+        g_last_error = "Capturing needs at least one token";
+        return -1;
+    }
+    if (n_positions < 1) {
+        g_last_error = "Capturing needs at least one position";
+        return -1;
+    }
+    try {
+        auto wrapper = static_cast<llama_wrapper_context_t*>(ctx);
+        if (!wrapper->ctx || !wrapper->model) {
+            g_last_error = "Context has been freed";
+            return -1;
+        }
+        const int n_ctx = static_cast<int>(llama_n_ctx(wrapper->ctx));
+        if (n_tokens > n_ctx) {
+            g_last_error = "Sequence of " + std::to_string(n_tokens) +
+                           " tokens exceeds the context of " + std::to_string(n_ctx);
+            return -1;
+        }
+        // Strictly increasing, so a row is copied at most once and the single
+        // pass over the windows below consumes the list in order.
+        for (int k = 0; k < n_positions; k++) {
+            if (positions[k] < 0 || positions[k] >= n_tokens) {
+                g_last_error = "Position " + std::to_string(positions[k]) + " at index " +
+                               std::to_string(k) + " is outside the sequence of " +
+                               std::to_string(n_tokens) + " tokens";
+                return -1;
+            }
+            if (k > 0 && positions[k] <= positions[k - 1]) {
+                g_last_error = "Positions have to be strictly increasing; index " +
+                               std::to_string(k) + " is " + std::to_string(positions[k]) +
+                               " after " + std::to_string(positions[k - 1]);
+                return -1;
+            }
+        }
+        const llama_vocab* vocab = llama_model_get_vocab(wrapper->model);
+        const int n_vocab = static_cast<int>(llama_vocab_n_tokens(vocab));
+        if (n_vocab <= 0) {
+            g_last_error = "The model reports an empty vocabulary";
+            return -1;
+        }
+        for (int i = 0; i < n_tokens; i++) {
+            if (tokens[i] < 0 || tokens[i] >= n_vocab) {
+                g_last_error = "Token " + std::to_string(tokens[i]) + " at position " +
+                               std::to_string(i) + " is outside the vocabulary";
+                return -1;
+            }
+        }
+        // With pooling the tensor llama.cpp copies is result_embd_pooled, one
+        // row per sequence. That is an embedding of the text, and the objective
+        // this exists for needs the representation of each token.
+        if (llama_pooling_type(wrapper->ctx) != LLAMA_POOLING_TYPE_NONE) {
+            g_last_error = "The context pools its embeddings; a per-token capture needs pooling type NONE";
+            return -1;
+        }
+        const int n_embd_out = static_cast<int>(llama_model_n_embd_out(wrapper->model));
+        if (n_embd_out <= 0) {
+            g_last_error = "The model reports no output embedding width";
+            return -1;
+        }
+        // Exact, not at least: a buffer sized for another width or another
+        // count is a buffer sized for another capture.
+        const long long need = static_cast<long long>(n_positions) * n_embd_out;
+        if (out_floats != need) {
+            g_last_error = "Output buffer holds " + std::to_string(out_floats) +
+                           " floats; the capture needs exactly " + std::to_string(need);
+            return -1;
+        }
+
+        // The KV cache is cleared rather than reused. Prefix reuse is what makes
+        // generation fast, and it is exactly wrong here: the cache was filled
+        // under whatever adapter was applied when it was written, and reading it
+        // after the adapter moved would capture a mixture of two models.
+        llama_memory_clear(llama_get_memory(wrapper->ctx), true);
+        // The prefix bookkeeping has to go with the cache it describes. A
+        // generate call reads cached_tokens to decide how many leading tokens it
+        // may skip; left populated over an emptied cache, it skips tokens that
+        // are no longer there and decodes on top of nothing.
+        wrapper->cached_tokens.clear();
+
+        // The same two bounds as llama_wrapper_score, duplicated on purpose so
+        // that this capability does not touch the scoring path: n_batch, because
+        // n_outputs_max defaults to it and exceeding it is a GGML_ASSERT that
+        // aborts the process; and 128 MB of logits per window, which are
+        // reserved per output row in embeddings mode as well.
+        const int n_batch = static_cast<int>(llama_n_batch(wrapper->ctx));
+        int window = n_batch > 0 ? n_batch : 512;
+        const int by_memory = static_cast<int>((128LL << 20) / (static_cast<long long>(n_vocab) * 4));
+        if (by_memory > 0 && by_memory < window) window = by_memory;
+        if (window < 1) window = 1;
+
+        embeddings_guard guard{wrapper->ctx, embeddings_after};
+        llama_set_embeddings(wrapper->ctx, true);
+
+        int k = 0;  // next position not yet copied out
+        for (int start = 0; start < n_tokens; start += window) {
+            const int count = std::min(window, n_tokens - start);
+            llama_batch batch = llama_batch_init(count, 0, 1);
+            for (int i = 0; i < count; i++) {
+                batch.token[i] = tokens[start + i];
+                batch.pos[i] = start + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                // Every row is an output row, so batch row i is sequence
+                // position start + i in the buffer that comes back.
+                batch.logits[i] = 1;
+            }
+            batch.n_tokens = count;
+
+            // The KV cache carries across windows, which is what makes this a
+            // single forward pass split into pieces rather than several passes.
+            const int32_t decoded = llama_decode(wrapper->ctx, batch);
+            if (decoded != 0) {
+                llama_batch_free(batch);
+                g_last_error = "llama_decode failed with " + std::to_string(decoded) +
+                               " on the window starting at " + std::to_string(start);
+                return -1;
+            }
+
+            // The pointer returned points into the context's own output buffer
+            // and is valid until the next llama_decode on this context, so each
+            // row is copied here, before the next window is decoded, and never
+            // retained.
+            while (k < n_positions && positions[k] < start + count) {
+                const int position = positions[k];
+                const float* row = llama_get_embeddings_ith(wrapper->ctx, position - start);
+                if (!row) {
+                    llama_batch_free(batch);
+                    g_last_error = "No embeddings row for position " + std::to_string(position);
+                    return -1;
+                }
+                // A non-finite value is a failure, not a result: a NaN target
+                // enters the objective and poisons the update without failing
+                // anything.
+                for (int j = 0; j < n_embd_out; j++) {
+                    if (!std::isfinite(row[j])) {
+                        llama_batch_free(batch);
+                        g_last_error = "Non-finite value at position " + std::to_string(position) +
+                                       ", column " + std::to_string(j);
+                        return -1;
+                    }
+                }
+                std::memcpy(out + static_cast<size_t>(k) * static_cast<size_t>(n_embd_out), row,
+                            static_cast<size_t>(n_embd_out) * sizeof(float));
+                k++;
+            }
+            llama_batch_free(batch);
+        }
+
+        if (k != n_positions) {
+            g_last_error = "Captured " + std::to_string(k) + " of " +
+                           std::to_string(n_positions) + " rows";
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        g_last_error = "Exception capturing: " + std::string(e.what());
+        return -1;
+    }
+}
+
+}  // extern "C"

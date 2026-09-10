@@ -37,9 +37,14 @@ type Context struct {
 	// applied is what SetAdapters last put on this context, so a reading can name
 	// the policy it was taken under.
 	applied []*Adapter
-	config  contextConfig
-	mu      sync.RWMutex
-	closed  bool
+	// appliedScales is the scale each entry of applied was set at, in the same
+	// order. A +eps and a -eps probe on one adapter are two policies, and a
+	// capture labelled by digests alone would hand a trainer one of them as the
+	// reference for the other.
+	appliedScales []float32
+	config        contextConfig
+	mu            sync.RWMutex
+	closed        bool
 }
 
 // Config types are defined in types.go

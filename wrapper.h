@@ -248,6 +248,40 @@ int llama_wrapper_score(void* ctx, const int* tokens, int n_tokens, int n_skip,
 // unlabelled one: it enters a comparison and moves the answer.
 int llama_wrapper_model_describe(void* model, char* buffer, int buffer_size);
 
+// Width of one captured row: llama_model_n_embd_out, which is n_embd unless the
+// architecture declares a separate output width (2048 for SmolLM3-3B). The
+// embeddings buffer llama.cpp fills is sized by this and not by n_embd, so the
+// caller sizes its buffer by this too. Returns -1 on a null model.
+int llama_wrapper_model_n_embd_out(void* model);
+
+// Capture the per-token final representation of a token sequence: the hidden
+// state after the final RMS normalisation and before the output projection,
+// which at the pinned llama.cpp commit is the graph tensor named "result_norm"
+// (res->t_embd). It is read through llama.cpp's own copy of that tensor: the
+// embeddings flag is switched on for the decode and restored to
+// embeddings_after on every exit, exceptions included. Measured bitwise equal
+// to the tensor observed with the scheduler callback, 14/14 rows.
+//
+// Clears the KV cache and the prefix bookkeeping first, as llama_wrapper_score
+// does: a cache filled under another adapter would capture a mixture of two
+// models. Decodes in the same windows as scoring, because logits are reserved
+// per output row in embeddings mode too. Every row of a window is an output
+// row: embeddings mode overrides a partial selection anyway, and a subset
+// decode differs from the full-window rows by up to 1.9e-6, so the rule is part
+// of the capture version.
+//
+// positions must be strictly increasing, each in [0, n_tokens). out receives
+// n_positions rows of n_embd_out floats, row k for positions[k]; out_floats
+// must equal n_positions * n_embd_out exactly. A non-finite value anywhere in a
+// row is a failure, not a result. Refused when the context pools
+// (pooling_type != NONE): the copied tensor would be a sequence embedding.
+// Returns 0 on success, -1 on failure with llama_wrapper_last_error set; on
+// failure out is unspecified.
+int llama_wrapper_capture_final(void* ctx, const int* tokens, int n_tokens,
+                                const int* positions, int n_positions,
+                                bool embeddings_after,
+                                float* out, long long out_floats);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,16 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+- `Context.CaptureFinal` returns the per-token final representation of a
+  token sequence at requested positions: the tensor named `result_norm` at the
+  pinned llama.cpp commit (after the final norm, before the output projection),
+  as `f32` rows of `n_embd_out`. Every decode-window row is computed as an
+  output row, the KV cache is cleared first, and non-finite rows are refused.
+  A `Capture` carries `TokenDigest` (tokens and positions) and `SnapshotDigest`
+  (quantisation, policy and adapter scales, with `CaptureVersion`), so two
+  captures of different policies never share a key; readings still label by
+  digests alone and do not carry scales.
+
 ## [0.2.0] - 2026-09-10
 
 The first release of this repository. It starts at `0.2.0` rather than `0.1.0`

@@ -88,7 +88,15 @@ func Take(ctx context.Context, s *LlamaService, actor security.Subject, c *Conte
 func (c *Context) appliedPolicy() (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.appliedPolicyLocked()
+}
 
+// appliedPolicyLocked is appliedPolicy for a caller that already holds c.mu, in
+// either mode. The mutex is not reentrant, and CaptureFinal labels the policy
+// under the write lock it computes the rows under -- so that the label names
+// the adapters the rows were actually produced with, and not whatever a
+// concurrent SetAdapters put on the context a moment later.
+func (c *Context) appliedPolicyLocked() (string, error) {
 	if c.closed {
 		return "", errors.New("llama: context is closed")
 	}

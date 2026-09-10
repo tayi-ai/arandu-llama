@@ -167,6 +167,81 @@ join, in a fixed order**: floating point addition is not associative, and a
 loss that changes with thread scheduling is a loss two runs cannot be compared
 on.
 
+## Capturing the final representation
+
+A loss says the two models disagree. A representation says where. The
+objective that trains a quantised base plus an adapter to match a
+high-precision reference compares, token by token, the hidden state after the
+final normalisation and before the output projection — so the quantity is a
+matrix, one row per requested position, and never a pooled embedding of the
+sequence.
+
+```go
+capture, err := ctx.CaptureFinal(tokens, llama.PositionsOf(mask))
+nEmbd, nPositions := capture.Shape()      // (2048, len(positions)) for SmolLM3-3B
+row := capture.Row(k)                     // the representation at capture.Positions[k]
+```
+
+### Which tensor, which rows
+
+At the pinned llama.cpp commit the tensor is the graph node named
+`result_norm`: the output of the final RMS norm including its learned scale,
+the immediate input of `result_output`, the lm_head. `Capture.Tensor` says so,
+`Capture.DType` is `f32`, and `Capture.Version` carries the commit, because
+the pin moving is the one event that changes every number while the name
+stays the same. A `tests/Unit` check ties the constant to the gitlink.
+
+The rows are read through llama.cpp's own copy of that tensor — the embeddings
+flag is switched on for the decode and restored afterwards — and were measured
+bitwise equal to the tensor a scheduler callback observes, 14 of 14 rows. A
+callback would have had to be installed at context creation and would
+synchronise every split of every decode on that context for the rest of its
+life.
+
+**Every row of every decode window is computed as an output row.** Embeddings
+mode overrides a partial selection anyway, and the choice moves the numbers: a
+decode that flags a subset of rows runs the last layer's FFN over a different
+number of rows and differs from the full-window rows by up to 1.9e-6. Which
+rows are computed is therefore part of the capture version; the positions only
+choose which rows are copied out.
+
+### Identity, so two captures cannot be confused
+
+`SnapshotDigest` names what produced the rows: the quantisation read from the
+model, the policy label the readings carry, **and the scale of each adapter**,
+folded with the version. The reading label alone does not carry scales, so a
+`+1` and a `-1` probe on one adapter share a policy string; their captures do
+not share a snapshot digest. `TokenDigest` names what was captured: the tokens
+and the positions, length-prefixed. Cache references by both.
+
+The model's identity is its description (`smollm3 3B Q4_K - Medium`), not a
+file digest: two files quantised the same way carry the same snapshot digest.
+A caller comparing against a checkpoint keys its cache by the checkpoint
+digest it already records.
+
+### Cost, cache and windows
+
+A capture costs `len(positions) × Width × 4` bytes of representation:
+16,777,216 bytes for SmolLM3-3B (`Width` 2048) at 2048 positions. Inside
+llama.cpp, transiently per window, it costs `window × (n_vocab + Width) × 4`
+bytes — 136,037,376 bytes at the 261-row window the 128 MiB logit cap gives
+SmolLM3 — because logits are reserved per output row in embeddings mode too.
+The windows are the scoring windows, bounded by `n_batch` and the logit cap for
+the same two reasons.
+
+The KV cache is **cleared** first, as before scoring: a cache filled under
+another adapter would capture a mixture of two models. A non-finite value
+anywhere in a row is refused rather than returned — a NaN target enters the
+objective and poisons the update without failing anything. A context that
+pools its embeddings is refused: the copied tensor would be a sequence
+embedding.
+
+Measured on CPU: two captures identical to the last digit, on the same context
+and on a fresh one; a changed token leaves every row before it bitwise
+unchanged and moves every row from it on; windows of 8 equal a single window.
+Not measured: the effect of an adapter on the rows (no LoRA file existed on the
+machine), and bit-stability of the copy on Metal or CUDA.
+
 ## Storing a reading
 
 `Take` scores and records in one call:

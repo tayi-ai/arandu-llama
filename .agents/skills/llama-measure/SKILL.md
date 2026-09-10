@@ -83,6 +83,28 @@ nothing" from "there is no key" cannot make the check that matters.
 next measurement reads without anybody intending it, and the difference is
 small enough to pass for noise.
 
+## A capture names its tensor and its rows
+
+`CaptureFinal` returns per-token rows of the tensor named `result_norm` at the
+pinned llama.cpp commit: the output of the final RMS norm, learned scale
+included, before `result_output` (the lm_head). Not a pooled embedding, not the
+residual before the norm, not the logits. `Capture.Tensor`, `Capture.DType`
+and `Capture.Version` say so, and the version carries the submodule commit
+because a pin bump changes every number while the name stays the same.
+`tests/Unit` ties the constant to the gitlink; bumping the pin means re-running
+the probe and the bitwise specs, then editing the constant.
+
+**Every row of every window is an output row.** A subset decode runs the last
+layer's FFN over a different number of rows and differs by up to 1.9e-6 from
+the full rows. That rule is part of the version; the positions choose only
+what is copied out. Do not "flag only the requested rows to save memory": it
+changes the numbers, and the memory is reserved per row either way.
+
+`SnapshotDigest` folds the quantisation, the policy label **and the adapter
+scales**; the reading label does not carry scales, so `+1` and `-1` on one
+adapter collide there and must not collide here. The KV cache is cleared first,
+as before scoring. A non-finite value in a row is refused, never returned.
+
 ## Touching the scoring window
 
 The windows are not an optimisation and cannot be removed for speed.

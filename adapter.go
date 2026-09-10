@@ -262,6 +262,7 @@ func (c *Context) SetAdapters(adapters []*Adapter, scales []float32) error {
 	// table, and that table is what a comparison is read from.
 	if applied >= 0 {
 		c.applied = append(c.applied[:0], adapters...)
+		c.appliedScales = append(c.appliedScales[:0], scales...)
 	}
 	// The C side copies both arrays and retains neither, but it reads them for
 	// the length of the call, and a collected scale array applies noise
