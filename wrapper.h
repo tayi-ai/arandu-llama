@@ -282,6 +282,63 @@ int llama_wrapper_capture_final(void* ctx, const int* tokens, int n_tokens,
                                 bool embeddings_after,
                                 float* out, long long out_floats);
 
+// The six tensors of one projection's LoRA arithmetic, in the order the graph
+// computes them. Every buffer is owned by the caller and its length is checked
+// exactly, never "at least": a buffer sized for another width is a buffer for
+// another capture.
+//
+//   x       the projection's input,     n_in  x n_tokens
+//   h       A * x,                      rank  x n_tokens
+//   u_pre   B * h, before the scale,    n_out x n_tokens
+//   u       the scaled contribution,    n_out x n_tokens
+//   y_base  W * x, without the adapter, n_out x n_tokens
+//   y       y_base + u,                 n_out x n_tokens
+//
+// u divided by u_pre is the scale llama.cpp actually applied, read off the graph
+// rather than inferred, which is what a comparison of two adapters against each
+// other cannot give.
+typedef struct llama_wrapper_lora_capture {
+    float* x;
+    long long x_floats;
+    float* h;
+    long long h_floats;
+    float* u_pre;
+    long long u_pre_floats;
+    float* u;
+    long long u_floats;
+    float* y_base;
+    long long y_base_floats;
+    float* y;
+    long long y_floats;
+} llama_wrapper_lora_capture;
+
+// Capture the LoRA arithmetic of one projection, on a context of its own.
+//
+// The nodes are found the way tools/imatrix finds its tensors: by the operation
+// and by the name of the WEIGHT operand, src[0]->name, which is the GGUF tensor
+// name and is stable. The graph node's own label is not usable -- llama.cpp
+// names build_lora_mm's intermediates "node_<N>", an ordinal that moves with the
+// graph shape, and on SmolLM3 the label "ffn_out-<il>" is even emitted for two
+// different tensors of the same layer.
+//
+// The context is created here and destroyed before returning, because cb_eval
+// can only be installed through llama_context_params at llama_init_from_model
+// and llama.h offers no setter afterwards. That is also why installing it costs
+// nothing that matters: the synchronisation it forces on every split lasts as
+// long as this one decode, not the life of a context that serves inference.
+//
+// module is the projection's weight name without a suffix, e.g.
+// "blk.35.ffn_down.weight"; the factors are looked for as module + ".lora_a"
+// and module + ".lora_b". adapter may be null, in which case only y_base and x
+// are filled and the four LoRA buffers must be null with zero lengths.
+//
+// A non-finite value anywhere is a failure, not a result. Returns 0 on success,
+// -1 on failure with llama_wrapper_last_error set.
+int llama_wrapper_capture_lora(void* model, const char* module,
+                               void* adapter, float adapter_scale,
+                               const int* tokens, int n_tokens, int n_ctx,
+                               llama_wrapper_lora_capture* out);
+
 #ifdef __cplusplus
 }
 #endif

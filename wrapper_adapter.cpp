@@ -17,6 +17,8 @@
 
 #include "wrapper.h"
 
+#include "ggml-backend.h"
+#include "ggml.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -652,6 +654,366 @@ int llama_wrapper_capture_final(void* ctx, const int* tokens, int n_tokens,
         return 0;
     } catch (const std::exception& e) {
         g_last_error = "Exception capturing: " + std::string(e.what());
+        return -1;
+    }
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
+// The LoRA arithmetic of one projection, observed.
+//
+// Every control that leaves B at zero measures a contribution of zero, and an
+// engine that applied a hundred times the right value would pass all of them.
+// So would a set of adapters compared against each other: a uniform factor k
+// survives every equality between two routes to the same contribution. The only
+// thing that settles it is reading the numbers the graph actually produced and
+// comparing them with arithmetic done somewhere else.
+//
+// The state is a file-scope object rather than user data because the callback is
+// a C function pointer with no room for a this, which is how tools/imatrix does
+// it too. The mutex is not decoration: the scheduler may reach the callback from
+// a backend thread.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct lora_collector {
+    std::mutex mu;
+    bool active = false;
+    std::string w_name, a_name, b_name;
+
+    // Node identities, remembered as the graph is walked, because the scale and
+    // the sum can only be recognised by which nodes they consume.
+    const ggml_tensor* base_node = nullptr;
+    const ggml_tensor* b_node = nullptr;
+    const ggml_tensor* scale_node = nullptr;
+
+    std::vector<float> x, h, u_pre, u, y_base, y;
+    bool got_x = false, got_h = false, got_u_pre = false;
+    bool got_u = false, got_y_base = false, got_y = false;
+    std::string failure;
+
+    void reset() {
+        active = false;
+        base_node = nullptr;
+        b_node = nullptr;
+        scale_node = nullptr;
+        x.clear(); h.clear(); u_pre.clear(); u.clear(); y_base.clear(); y.clear();
+        got_x = got_h = got_u_pre = got_u = got_y_base = got_y = false;
+        failure.clear();
+    }
+};
+
+lora_collector g_lora;
+
+// undecorated strips the backend prefix the scheduler adds to a copied operand.
+//
+// When a node runs on a backend that does not own its operand's buffer,
+// ggml_backend_sched_split_graph makes a copy, names it "<backend>#<name>#<id>"
+// and -- the part that matters -- replaces node->src[j] with the copy. So the
+// callback sees "CUDA0#blk.35.ffn_down.weight#0" where the GGUF says
+// "blk.35.ffn_down.weight", and an exact comparison matches nothing.
+//
+// tools/imatrix carries the same function for the same reason, with that exact
+// example in its comment. Without it the capture fails whenever the projection
+// asked for sits on a layer that stayed on the CPU -- which is the expected
+// shape of a 27B on cards with about fourteen gigabytes free.
+std::string undecorated(const char* raw) {
+    std::string name(raw ? raw : "");
+    const size_t first = name.find('#');
+    if (first == std::string::npos) return name;
+    const size_t second = name.find('#', first + 1);
+    if (second == std::string::npos) return name.substr(first + 1);
+    return name.substr(first + 1, second - first - 1);
+}
+
+bool named_is(const ggml_tensor* t, const std::string& want) {
+    return t && !want.empty() && want == undecorated(ggml_get_name(t));
+}
+
+// read_into copies a tensor out of whatever buffer it lives in.
+//
+// ggml_backend_tensor_get rather than t->data, and not as a precaution: on Metal
+// the pointer is not host readable at all, and on CUDA it addresses device
+// memory. imatrix and cvector-generator both read this way.
+bool read_into(const ggml_tensor* t, std::vector<float>& into) {
+    if (!t) {
+        g_lora.failure = "a tensor the capture needs is absent from the graph";
+        return false;
+    }
+    if (t->type != GGML_TYPE_F32) {
+        g_lora.failure = std::string("tensor ") + ggml_get_name(t) + " is type " +
+                         std::to_string(static_cast<int>(t->type)) + ", not F32";
+        return false;
+    }
+    const int64_t n = ggml_nelements(t);
+    if (n <= 0) {
+        g_lora.failure = std::string("tensor ") + ggml_get_name(t) + " holds no element";
+        return false;
+    }
+    into.resize(static_cast<size_t>(n));
+    ggml_backend_tensor_get(t, into.data(), 0, static_cast<size_t>(n) * sizeof(float));
+    for (int64_t i = 0; i < n; i++) {
+        if (!std::isfinite(into[static_cast<size_t>(i)])) {
+            // A non-finite value is a failure, not a result: it would enter the
+            // comparison and read as a difference nobody could attribute.
+            g_lora.failure = std::string("non-finite value in ") + ggml_get_name(t) +
+                             " at index " + std::to_string(i);
+            return false;
+        }
+    }
+    return true;
+}
+
+// wanted decides, from the operation and the name of the weight operand, whether
+// this node is one of the six. It has to give the same answer on the ask call
+// and on the call that follows it, which is why it reads state that only the
+// collecting call writes: a node is recognised after the node it consumes.
+bool wanted(const ggml_tensor* t) {
+    if (t->op == GGML_OP_MUL_MAT) {
+        return named_is(t->src[0], g_lora.w_name) ||
+               named_is(t->src[0], g_lora.a_name) ||
+               named_is(t->src[0], g_lora.b_name);
+    }
+    if (t->op == GGML_OP_SCALE) {
+        return g_lora.b_node != nullptr && t->src[0] == g_lora.b_node;
+    }
+    if (t->op == GGML_OP_ADD) {
+        // Both operands, not just the scaled contribution. build_lora_mm does
+        //
+        //   res = W*x ; if (w_s) res = res * w_s ; res = res + ab
+        //
+        // so with a per-tensor scale present the sum's left operand is a
+        // GGML_OP_MUL, not the matmul that was captured as y_base. Matching on
+        // src[1] alone would fill all six buffers, return success, and hand back
+        // a set where y != y_base + u by a uniform factor -- which is exactly
+        // the kind of defect this whole capture exists to expose. Requiring both
+        // makes that case fail loudly instead.
+        return g_lora.scale_node != nullptr && g_lora.base_node != nullptr &&
+               t->src[1] == g_lora.scale_node && t->src[0] == g_lora.base_node;
+    }
+    return false;
+}
+
+bool collect(ggml_tensor* t) {
+    if (t->op == GGML_OP_MUL_MAT) {
+        if (named_is(t->src[0], g_lora.w_name)) {
+            // The base projection. Its right operand is the input the whole
+            // chain is a function of, and it is still live: it is a source of
+            // the node the callback is holding.
+            if (!read_into(t, g_lora.y_base)) return false;
+            if (!read_into(t->src[1], g_lora.x)) return false;
+            g_lora.got_y_base = g_lora.got_x = true;
+            // Remembered so the sum can be required to consume this very node,
+            // and not a per-tensor rescaling of it.
+            g_lora.base_node = t;
+            return true;
+        }
+        if (named_is(t->src[0], g_lora.a_name)) {
+            if (!read_into(t, g_lora.h)) return false;
+            g_lora.got_h = true;
+            return true;
+        }
+        if (named_is(t->src[0], g_lora.b_name)) {
+            if (!read_into(t, g_lora.u_pre)) return false;
+            g_lora.got_u_pre = true;
+            // Remembered so the scale that consumes it can be recognised: the
+            // scale node carries no name of its own.
+            g_lora.b_node = t;
+            return true;
+        }
+        return true;
+    }
+    if (t->op == GGML_OP_SCALE) {
+        if (!read_into(t, g_lora.u)) return false;
+        g_lora.got_u = true;
+        g_lora.scale_node = t;
+        return true;
+    }
+    if (t->op == GGML_OP_ADD) {
+        if (!read_into(t, g_lora.y)) return false;
+        g_lora.got_y = true;
+        return true;
+    }
+    return true;
+}
+
+bool lora_eval_callback(ggml_tensor* t, bool ask, void* user_data) {
+    (void)user_data;
+    std::lock_guard<std::mutex> lock(g_lora.mu);
+    if (!g_lora.active) return false;
+    if (!g_lora.failure.empty()) return false;
+    if (ask) return wanted(t);
+    if (!wanted(t)) return true;
+    // Returning false here stops the rest of the split, which is what a failure
+    // should do: carrying on would fill some buffers and not others.
+    return collect(t);
+}
+
+}  // namespace
+
+extern "C" {
+
+int llama_wrapper_capture_lora(void* model, const char* module,
+                               void* adapter, float adapter_scale,
+                               const int* tokens, int n_tokens, int n_ctx,
+                               llama_wrapper_lora_capture* out) {
+    if (!model || !module || !tokens || !out) {
+        g_last_error = "Model, module, tokens and an output struct are required";
+        return -1;
+    }
+    if (n_tokens < 1) {
+        g_last_error = "Capturing needs at least one token";
+        return -1;
+    }
+    if (n_ctx < n_tokens) {
+        g_last_error = "The context of " + std::to_string(n_ctx) + " is shorter than the " +
+                       std::to_string(n_tokens) + " tokens to capture";
+        return -1;
+    }
+    if (!adapter && (out->h || out->u_pre || out->u || out->y)) {
+        g_last_error = "Without an adapter only x and y_base are captured; the other buffers must be null";
+        return -1;
+    }
+
+    llama_context* ctx = nullptr;
+    try {
+        auto wrapper = static_cast<llama_wrapper_model_t*>(model);
+        const llama_vocab* vocab = llama_model_get_vocab(wrapper->model);
+        const int n_vocab = static_cast<int>(llama_vocab_n_tokens(vocab));
+        for (int i = 0; i < n_tokens; i++) {
+            if (tokens[i] < 0 || tokens[i] >= n_vocab) {
+                g_last_error = "Token " + std::to_string(tokens[i]) + " at position " +
+                               std::to_string(i) + " is outside the vocabulary";
+                return -1;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_lora.mu);
+            if (g_lora.active) {
+                // One collector, one capture. Two at once would interleave their
+                // nodes and fill each other's buffers.
+                g_last_error = "Another LoRA capture is in progress on this process";
+                return -1;
+            }
+            g_lora.reset();
+            g_lora.w_name = module;
+            if (adapter) {
+                g_lora.a_name = std::string(module) + ".lora_a";
+                g_lora.b_name = std::string(module) + ".lora_b";
+            }
+            g_lora.active = true;
+        }
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = static_cast<uint32_t>(n_ctx);
+        cparams.n_batch = static_cast<uint32_t>(n_ctx);
+        cparams.n_ubatch = static_cast<uint32_t>(n_ctx);
+        // The whole reason this function owns a context: cb_eval is reachable
+        // only through llama_context_params, and llama.h has no setter for it
+        // afterwards. The context is destroyed before this returns, so the
+        // per-split synchronisation the callback forces lasts one decode.
+        cparams.cb_eval = lora_eval_callback;
+        cparams.cb_eval_user_data = nullptr;
+
+        ctx = llama_init_from_model(wrapper->model, cparams);
+        if (!ctx) {
+            std::lock_guard<std::mutex> lock(g_lora.mu);
+            g_lora.active = false;
+            g_last_error = "Failed to create the diagnostic context";
+            return -1;
+        }
+
+        if (adapter) {
+            llama_adapter_lora* lora = static_cast<llama_adapter_lora*>(adapter);
+            if (llama_set_adapters_lora(ctx, &lora, 1, &adapter_scale) != 0) {
+                llama_free(ctx);
+                std::lock_guard<std::mutex> lock(g_lora.mu);
+                g_lora.active = false;
+                g_last_error = "Failed to apply the adapter to the diagnostic context";
+                return -1;
+            }
+        }
+
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            batch.token[i] = tokens[i];
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            // Every row an output row, the same rule llama_wrapper_capture_final
+            // follows, and here it is not a nicety. When fewer rows are flagged
+            // than the batch holds, build_inp_out_ids emits a get_rows of that
+            // length and every builder applies it at the last layer, BEFORE the
+            // final FFN. So flagging only the last token would narrow the last
+            // block's ffn_norm and its three projections to a single column --
+            // and blk.35.ffn_down.weight, the module this function documents as
+            // its example, is in that block.
+            batch.logits[i] = 1;
+        }
+        batch.n_tokens = n_tokens;
+        const int32_t decoded = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+
+        std::string failure;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(g_lora.mu);
+            g_lora.active = false;
+            failure = g_lora.failure;
+            ok = failure.empty() && decoded == 0;
+        }
+        if (decoded != 0 && failure.empty()) {
+            failure = "llama_decode failed with " + std::to_string(decoded);
+        }
+        if (!ok) {
+            llama_free(ctx);
+            g_last_error = failure;
+            return -1;
+        }
+
+        // Copied out under the lock, and the lengths are checked exactly: a
+        // buffer sized for another width is a buffer for another capture.
+        std::lock_guard<std::mutex> lock(g_lora.mu);
+        struct slot {
+            const char* name;
+            bool got;
+            const std::vector<float>* from;
+            float* into;
+            long long floats;
+        };
+        const slot slots[] = {
+            {"x", g_lora.got_x, &g_lora.x, out->x, out->x_floats},
+            {"y_base", g_lora.got_y_base, &g_lora.y_base, out->y_base, out->y_base_floats},
+            {"h", g_lora.got_h, &g_lora.h, out->h, out->h_floats},
+            {"u_pre", g_lora.got_u_pre, &g_lora.u_pre, out->u_pre, out->u_pre_floats},
+            {"u", g_lora.got_u, &g_lora.u, out->u, out->u_floats},
+            {"y", g_lora.got_y, &g_lora.y, out->y, out->y_floats},
+        };
+        for (const slot& s : slots) {
+            if (!s.into) continue;
+            if (!s.got) {
+                llama_free(ctx);
+                g_last_error = std::string("the graph produced no ") + s.name + " for " + module;
+                return -1;
+            }
+            if (s.floats != static_cast<long long>(s.from->size())) {
+                llama_free(ctx);
+                g_last_error = std::string("buffer for ") + s.name + " holds " +
+                               std::to_string(s.floats) + " floats; the capture produced " +
+                               std::to_string(s.from->size());
+                return -1;
+            }
+            std::memcpy(s.into, s.from->data(), s.from->size() * sizeof(float));
+        }
+        llama_free(ctx);
+        return 0;
+    } catch (const std::exception& e) {
+        if (ctx) llama_free(ctx);
+        std::lock_guard<std::mutex> lock(g_lora.mu);
+        g_lora.active = false;
+        g_last_error = "Exception capturing the LoRA arithmetic: " + std::string(e.what());
         return -1;
     }
 }
