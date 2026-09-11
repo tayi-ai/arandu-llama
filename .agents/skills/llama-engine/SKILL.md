@@ -100,6 +100,25 @@ backend library, and the copy failed after every object in llama.cpp had
 already been compiled. The archive in `BACKEND_STATIC_LIBS` already carries
 those objects.
 
+## The backend tag
+
+`BUILD_TYPE=cublas` compiles the CUDA archives. It does **not** tell the Go
+linker to use them: `llama_cublas_static.go` sits behind `//go:build cublas &&
+!shared_lib`, and that file is where `-lggml-cuda -lcudart -lcublas -lcuda
+-lnccl` live.
+
+So a CUDA build is two things, and forgetting the second one fails at the link
+with `undefined reference to 'cudaMallocHost'` after the whole CUDA compile has
+succeeded:
+
+```bash
+make BUILD_TYPE=cublas BUILD_LINKAGE=static CUDA_ARCHITECTURES=75 libbinding.a
+go build -tags cublas ./...
+```
+
+Metal and CPU need no tag. That is why this passes on a laptop and fails on the
+first node, forty minutes in.
+
 ## Linking from a consumer
 
 The package declares `-L./`, which for a dependency resolves to the module

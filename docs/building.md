@@ -56,6 +56,39 @@ libggml on its library path.
 cheaper and a deployment harder, because every host then needs the libraries
 and an `LD_LIBRARY_PATH` that finds them.
 
+## The build tag that selects the backend
+
+Building the archives is half of it. The Go side needs a tag to link them, and
+the tag has the same name as the `BUILD_TYPE`:
+
+| `BUILD_TYPE` | `go build -tags` |
+| --- | --- |
+| *(empty)*, `metal` | none |
+| `cublas` | `cublas` |
+| `hipblas` | `hipblas` |
+| `clblas` | `clblas` |
+| any, with `BUILD_LINKAGE=shared` | add `shared_lib` |
+
+`llama_cublas_static.go` carries `-lggml-cuda -lcudart -lcublas -lcuda -lnccl`
+behind `//go:build cublas && !shared_lib`. Without the tag that file is not
+compiled, those flags never reach the linker, and the build fails with a page
+of
+
+```text
+undefined reference to `cudaMallocHost'
+undefined reference to `cublasGemmStridedBatchedEx'
+```
+
+**after** the CUDA compile has reached 100%, which is the expensive place to
+find out. A consumer that also has its own tag passes both:
+
+```bash
+go build -tags "llama cublas" .
+```
+
+Metal and the plain CPU build need no tag, which is why this is easy to miss on
+a laptop and fails on the first node.
+
 ## Linking from an application
 
 The package declares `-L./`, which resolves to its own directory. For a

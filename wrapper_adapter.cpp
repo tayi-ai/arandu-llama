@@ -391,6 +391,32 @@ int llama_wrapper_score(void* ctx, const int* tokens, int n_tokens, int n_skip,
             g_last_error = "No position was scored";
             return -1;
         }
+
+        // A mean of exactly log(n_vocab) is a model that produced nothing.
+        //
+        // That is the uniform distribution: every token equally likely, which is
+        // what the graph returns when the forward pass did not actually run. It
+        // is not a bad model -- a bad model is wrong in some direction, and this
+        // is wrong in none.
+        //
+        // Measured on 2026-09-10, splitting a model across two Tesla T10s: the
+        // score came back 11.76178354556442 for SmolLM3 in F16, in Q4_K_M and in
+        // Q2_K alike, and log(128256) is 11.7617835455. Identical to ten places
+        // across three different quantisations is not a coincidence, and the
+        // failure was intermittent -- two runs in eight with the same command.
+        // A quarter of the time it returned a number that reads as a loss.
+        //
+        // The tolerance is tight on purpose. A real model landing this close to
+        // uniform by accident would be reporting the same thing anyway.
+        const double uniform = std::log(static_cast<double>(n_vocab));
+        const double mean = -sum / static_cast<double>(counted);
+        if (std::fabs(mean - uniform) < 1e-9) {
+            g_last_error = "The score is log(n_vocab) = " + std::to_string(uniform) +
+                           ", which is the uniform distribution: the forward pass produced no "
+                           "information. On CUDA this is what a model split across two devices "
+                           "returns, intermittently. Run on one device.";
+            return -1;
+        }
         // The caller receives the sum and the count rather than the mean, so a
         // caller averaging over several examples weights them by length instead
         // of averaging averages.
