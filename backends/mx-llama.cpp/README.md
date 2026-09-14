@@ -22,15 +22,24 @@ depois de cada item, inclusive o último:
 a245214d8df6304762c7688c6b8ee45652c5c8e5
 75
 64
+patch:max-devices-64:5a2e22b2a1a1bf3009bb775b31bf0e9ed65474cc2912387a00b9076d406676cc
 llama-cli:604a5ad57e3545e1ff4e119bc78a280a98075a59c228305e21dce41c38791fb9
-llama-server:482302ee1b9f9145da85c753231399de423021213b071d32eb75cf8fba88f438
+llama-server:482302bc25ca9b2ee5b1cc1532508ab9ea62d22f841caa9846eadd576f72eccc
 ggml-rpc-server:182a313ddef3c90703a6d38cd90dc66bfccf4aeabbc93cdd85494eabf0332dd5
+libllama.so.0.3.0:92cb8adca8177feb417a9c3aee856ee1a72f1390f387459b9a533fd52c0408ad
+env:GGML_CUDA_Q8_1_CACHE=0
 ```
 
 O resultado qualificado é
-`8e3296f980b6a01e3933ce6fba2e77c933df112a0bbc419acb4a22b724a8c8d0`.
+`77c0d31dcf59a4798289f90279f3e25668873edd059d7701b47b9d8a10d4a05d`.
 O arquivo `manifest.json`, a constante Go e o manifesto instalado precisam
 concordar antes de uma release ser admitida.
+
+O cache opcional CUDA Q8_1 permanece desligado nesta release. A carga
+distribuída de qualificação encontrou uma liberação fora da ordem LIFO no pool
+VMM desse cache; o próprio fork define `GGML_CUDA_Q8_1_CACHE=0` como retorno ao
+comportamento anterior. O backend fixa esse valor tanto nos RPCs quanto no
+coordenador, sem alterar pesos ou binários.
 
 ## Construção reproduzível
 

@@ -23,22 +23,24 @@ const (
 	mxRevision          = "a245214d8df6304762c7688c6b8ee45652c5c8e5"
 	mxRPCDigest         = "182a313ddef3c90703a6d38cd90dc66bfccf4aeabbc93cdd85494eabf0332dd5"
 	mxCLIDigest         = "604a5ad57e3545e1ff4e119bc78a280a98075a59c228305e21dce41c38791fb9"
-	mxServerDigest      = "482302ee1b9f9145da85c753231399de423021213b071d32eb75cf8fba88f438"
-	mxRuntimeDigest     = "8e3296f980b6a01e3933ce6fba2e77c933df112a0bbc419acb4a22b724a8c8d0"
-	mxManifestDigest    = "919222c9259f179a890c98b549638ebdd17a84ce06ef02bb3650b8c1bdc7193e"
+	mxServerDigest      = "482302bc25ca9b2ee5b1cc1532508ab9ea62d22f841caa9846eadd576f72eccc"
+	mxLibLlamaDigest    = "92cb8adca8177feb417a9c3aee856ee1a72f1390f387459b9a533fd52c0408ad"
+	mxRuntimeDigest     = "77c0d31dcf59a4798289f90279f3e25668873edd059d7701b47b9d8a10d4a05d"
+	mxManifestDigest    = "919222563fbd153ccaff4b2a71ac74ae6f510093535ccb579109c1e490f412fa"
 	mxModelRelativePath = "DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf"
 )
 
 // MXManifest identifies the source, build and executables admitted by this backend.
 type MXManifest struct {
-	Backend           string
-	Repository        string
-	Revision          string
-	CUDAArchitecture  string
-	SchedulerBackends int
-	RuntimeDigest     string
-	ModelDigest       string
-	Binaries          map[string]string
+	Backend            string
+	Repository         string
+	Revision           string
+	CUDAArchitecture   string
+	SchedulerBackends  int
+	RuntimeDigest      string
+	ModelDigest        string
+	Binaries           map[string]string
+	RuntimeEnvironment map[string]string
 }
 
 // AdmittedMXManifest returns the immutable identity accepted by this release.
@@ -49,8 +51,10 @@ func AdmittedMXManifest() MXManifest {
 		RuntimeDigest: mxRuntimeDigest, ModelDigest: mxManifestDigest,
 		Binaries: map[string]string{
 			"llama-cli": mxCLIDigest, "llama-server": mxServerDigest,
-			"ggml-rpc-server": mxRPCDigest,
+			"libllama.so.0.3.0": mxLibLlamaDigest,
+			"ggml-rpc-server":   mxRPCDigest,
 		},
+		RuntimeEnvironment: map[string]string{"GGML_CUDA_Q8_1_CACHE": "0"},
 	}
 }
 
@@ -62,6 +66,7 @@ func AdmittedMXManifest() MXManifest {
 type NativeProcess struct {
 	Path string
 	Args []string
+	Env  []string
 }
 
 // MXConfig names the installed, versioned runtime and model cache.
@@ -117,6 +122,7 @@ func (b *MXBackend) RPC(in MXRPCRequest) (NativeProcess, error) {
 		Path: "/usr/bin/timeout",
 		Args: []string{"--signal=TERM", "--kill-after=30s", strconv.FormatInt(int64(in.Deadline.Seconds()), 10) + "s",
 			filepath.Join(b.runtimeRoot, "bin", "ggml-rpc-server"), "-H", in.BindIP, "-p", strconv.Itoa(in.Port), "-d", "CUDA0,CUDA1", "-c"},
+		Env: mxRuntimeEnvironment(),
 	}, nil
 }
 
@@ -129,6 +135,91 @@ type MXGenerateRequest struct {
 	Deadline     time.Duration
 }
 
+// MXServeRequest is the resident, authenticated coordinator admitted for
+// repeated scoring and generation. RPC participants keep the model distributed
+// while the HTTP process owns the local context on coordinator one.
+type MXServeRequest struct {
+	RPCEndpoints []string
+	BindIP       string
+	Port         int
+	Context      int
+	Deadline     time.Duration
+	Adapters     []MXAdapter
+}
+
+// MXAdapter identifies one immutable GGUF LoRA available to the coordinator.
+// It is loaded at scale zero so each measurement can select exactly one
+// complete factor-space candidate without restarting the quantized base.
+type MXAdapter struct {
+	Path   string
+	SHA256 string
+}
+
+// Serve builds a resident llama-server without accepting an executable or
+// model path. Authentication is supplied by the supervising application in the
+// LLAMA_API_KEY environment variable, so it never appears in process arguments.
+func (b *MXBackend) Serve(in MXServeRequest) (NativeProcess, error) {
+	if err := validateMXEndpoints(in.RPCEndpoints); err != nil {
+		return NativeProcess{}, err
+	}
+	ip := net.ParseIP(in.BindIP)
+	if ip == nil || ip.To4() == nil || !privateOrCGNATAddress(ip) {
+		return NativeProcess{}, errors.New("llama: MX server bind address has to be private or CGNAT IPv4")
+	}
+	if in.Port != 50053 {
+		return NativeProcess{}, errors.New("llama: MX server port is not admitted")
+	}
+	if in.Context != 4096 {
+		return NativeProcess{}, errors.New("llama: MX server qualification context has to be 4096")
+	}
+	if in.Deadline < time.Minute || in.Deadline > 12*time.Hour {
+		return NativeProcess{}, errors.New("llama: MX server deadline has to be between one minute and twelve hours")
+	}
+	if len(in.Adapters) > 16 {
+		return NativeProcess{}, errors.New("llama: MX server admits at most 16 factor-space candidates")
+	}
+	seenAdapters := make(map[string]bool, len(in.Adapters))
+	for _, adapter := range in.Adapters {
+		if !filepath.IsAbs(adapter.Path) || strings.ContainsAny(adapter.Path, ",:") {
+			return NativeProcess{}, errors.New("llama: MX adapter path has to be absolute and contain no list separators")
+		}
+		if seenAdapters[adapter.Path] {
+			return NativeProcess{}, errors.New("llama: MX adapter paths have to be unique")
+		}
+		seenAdapters[adapter.Path] = true
+		if len(adapter.SHA256) != 64 {
+			return NativeProcess{}, errors.New("llama: MX adapter digest is malformed")
+		}
+		if err := verifyFile(adapter.Path, adapter.SHA256); err != nil {
+			return NativeProcess{}, fmt.Errorf("llama: verify MX adapter %s: %w", filepath.Base(adapter.Path), err)
+		}
+	}
+	model, err := b.admittedModel()
+	if err != nil {
+		return NativeProcess{}, err
+	}
+	return b.serveProcess(model, in), nil
+}
+
+func (b *MXBackend) serveProcess(model string, in MXServeRequest) NativeProcess {
+	args := []string{"--signal=TERM", "--kill-after=60s", strconv.FormatInt(int64(in.Deadline.Seconds()), 10) + "s",
+		filepath.Join(b.runtimeRoot, "bin", "llama-server"),
+		"-m", model, "--rpc", strings.Join(in.RPCEndpoints, ","), "--split-mode", "layer",
+		"--gpu-layers", "auto", "--fit", "on", "--fit-target", "3200", "--fit-ctx", "4096",
+		"-c", "4096", "-b", "512", "-ub", "128", "--load-mode", "dio", "--lazy-mode", "auto",
+		"--no-host", "--no-repack", "--no-warmup", "--host", in.BindIP, "--port", strconv.Itoa(in.Port),
+		"--alias", "tayi-flash", "--metrics",
+	}
+	if len(in.Adapters) > 0 {
+		adapters := make([]string, 0, len(in.Adapters))
+		for _, adapter := range in.Adapters {
+			adapters = append(adapters, adapter.Path+":0")
+		}
+		args = append(args, "--lora-scaled", strings.Join(adapters, ","))
+	}
+	return NativeProcess{Path: "/usr/bin/timeout", Args: args, Env: mxRuntimeEnvironment()}
+}
+
 // Generate builds the coordinator process without accepting an executable or model path.
 func (b *MXBackend) Generate(in MXGenerateRequest) (NativeProcess, error) {
 	if err := validateMXEndpoints(in.RPCEndpoints); err != nil {
@@ -137,8 +228,8 @@ func (b *MXBackend) Generate(in MXGenerateRequest) (NativeProcess, error) {
 	if strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 4096 {
 		return NativeProcess{}, errors.New("llama: MX prompt has to contain between 1 and 4096 bytes")
 	}
-	if in.MaxTokens < 1 || in.MaxTokens > 256 {
-		return NativeProcess{}, errors.New("llama: MX max tokens has to be between 1 and 256")
+	if in.MaxTokens < 1 || in.MaxTokens > 1024 {
+		return NativeProcess{}, errors.New("llama: MX max tokens has to be between 1 and 1024")
 	}
 	if in.Context != 4096 {
 		return NativeProcess{}, errors.New("llama: MX qualification context has to be 4096")
@@ -146,22 +237,53 @@ func (b *MXBackend) Generate(in MXGenerateRequest) (NativeProcess, error) {
 	if in.Deadline < time.Minute || in.Deadline > 3*time.Hour {
 		return NativeProcess{}, errors.New("llama: MX generation deadline has to be between one minute and three hours")
 	}
-	if err := verifyFile(filepath.Join(b.modelRoot, "SHA256SUMS"), mxManifestDigest); err != nil {
-		return NativeProcess{}, fmt.Errorf("llama: verify MX model manifest: %w", err)
+	model, err := b.admittedModel()
+	if err != nil {
+		return NativeProcess{}, err
 	}
-	model := filepath.Join(b.modelRoot, mxModelRelativePath)
-	if info, err := os.Stat(model); err != nil || !info.Mode().IsRegular() {
-		return NativeProcess{}, errors.New("llama: admitted MX model shard is absent")
-	}
+	return b.generateProcess(model, in), nil
+}
+
+func (b *MXBackend) generateProcess(model string, in MXGenerateRequest) NativeProcess {
 	args := []string{"--signal=TERM", "--kill-after=60s", strconv.FormatInt(int64(in.Deadline.Seconds()), 10) + "s",
 		filepath.Join(b.runtimeRoot, "bin", "llama-cli"),
 		"-m", model, "--rpc", strings.Join(in.RPCEndpoints, ","), "--split-mode", "layer",
 		"--gpu-layers", "auto", "--fit", "on", "--fit-target", "3200", "--fit-ctx", "4096",
 		"-c", "4096", "-b", "512", "-ub", "128", "--load-mode", "dio", "--lazy-mode", "auto",
-		"--no-warmup", "--seed", "59", "--temp", "0", "-n", strconv.Itoa(in.MaxTokens),
+		"--no-host", "--no-repack", "--no-warmup", "--single-turn", "--seed", "59", "--temp", "0", "-n", strconv.Itoa(in.MaxTokens),
 		"--no-display-prompt", "-p", in.Prompt,
 	}
-	return NativeProcess{Path: "/usr/bin/timeout", Args: args}, nil
+	return NativeProcess{Path: "/usr/bin/timeout", Args: args, Env: mxRuntimeEnvironment()}
+}
+
+func (b *MXBackend) admittedModel() (string, error) {
+	if err := verifyFile(filepath.Join(b.modelRoot, "SHA256SUMS"), mxManifestDigest); err != nil {
+		return "", fmt.Errorf("llama: verify MX model manifest: %w", err)
+	}
+	model := filepath.Join(b.modelRoot, mxModelRelativePath)
+	if info, err := os.Stat(model); err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("llama: admitted MX model shard is absent")
+	}
+	return model, nil
+}
+
+// AdmittedModelPath verifies and returns the first shard of the pinned model.
+// Callers may inspect its GGUF metadata but cannot select another model path.
+func (b *MXBackend) AdmittedModelPath() (string, error) { return b.admittedModel() }
+
+// mxRuntimeEnvironment fixes every native process to the qualified runtime
+// behavior. The pinned fork documents that disabling this optional cache
+// restores its previous CUDA path. A duplicate inherited value must not be able
+// to reactivate the cache after the release was admitted.
+func mxRuntimeEnvironment() []string {
+	const key = "GGML_CUDA_Q8_1_CACHE="
+	environment := make([]string, 0, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, key) {
+			environment = append(environment, value)
+		}
+	}
+	return append(environment, key+"0")
 }
 
 func validateMXEndpoints(endpoints []string) error {

@@ -14,8 +14,11 @@ func TestMXManifestKeepsTheQualifiedBuildIdentity(t *testing.T) {
 	if m.CUDAArchitecture != "75" || m.SchedulerBackends != 64 {
 		t.Fatalf("qualified build settings drifted: %+v", m)
 	}
-	if len(m.Binaries) != 3 {
+	if len(m.Binaries) != 4 || m.Binaries["libllama.so.0.3.0"] != "92cb8adca8177feb417a9c3aee856ee1a72f1390f387459b9a533fd52c0408ad" {
 		t.Fatalf("qualified binary set has %d entries", len(m.Binaries))
+	}
+	if m.RuntimeEnvironment["GGML_CUDA_Q8_1_CACHE"] != "0" {
+		t.Fatalf("qualified runtime environment drifted: %+v", m.RuntimeEnvironment)
 	}
 }
 
