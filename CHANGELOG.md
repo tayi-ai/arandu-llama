@@ -10,15 +10,46 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
-- `Context.CaptureFinal` returns the per-token final representation of a
-  token sequence at requested positions: the tensor named `result_norm` at the
-  pinned llama.cpp commit (after the final norm, before the output projection),
-  as `f32` rows of `n_embd_out`. Every decode-window row is computed as an
-  output row, the KV cache is cleared first, and non-finite rows are refused.
-  A `Capture` carries `TokenDigest` (tokens and positions) and `SnapshotDigest`
-  (quantisation, policy and adapter scales, with `CaptureVersion`), so two
-  captures of different policies never share a key; readings still label by
-  digests alone and do not carry scales.
+## [0.4.0] - 2026-09-13
+
+### Added
+
+- A versioned `backends/mx` subprocess package beside the existing in-process
+  llama.cpp package. It admits only the qualified SM75 build at revision
+  `a245214d`, verifies all three executable digests and the model manifest, and
+  returns typed process specifications without accepting shell text or paths
+  from a request.
+- Bounded RPC and generation specifications for the measured Tayi topology:
+  twenty unique private or CGNAT RPC endpoints, two CUDA devices per RPC host,
+  64 scheduler backends, fixed context and deterministic sampling, all under a
+  process deadline.
+- A checked-in backend manifest and reproducible Makefile for the qualified
+  `llama-cli`, `llama-server` and `ggml-rpc-server` build.
+- `Model.CaptureLoRA` records the input, low-rank projection, unscaled and
+  scaled contribution, base projection and final projection for each token.
+  `LoRACapture.AppliedScale` exposes the factor the graph actually applied.
+
+## [0.3.1] - 2026-09-10
+
+### Fixed
+
+- Scoring refuses a mean equal to `log(n_vocab)`, the uniform-distribution
+  result observed intermittently when CUDA split the measured model over two
+  devices, instead of returning it as a plausible loss.
+
+## [0.3.0] - 2026-09-10
+
+### Added
+
+- `Context.CaptureFinal` returns requested per-token `result_norm` rows as
+  finite `f32` values, labelled by token, quantisation, policy and adapter
+  digests so captures from different conditions cannot share an identity.
+
+## [0.2.1] - 2026-09-10
+
+### Fixed
+
+- Worker construction failures return an error instead of aborting the process.
 
 ## [0.2.0] - 2026-09-10
 
@@ -73,5 +104,9 @@ code and must never be tagged again.**
   plausible number can come out wrong.
 - `.agents/skills/` — six procedures, one per situation.
 
-[Unreleased]: https://github.com/tayi-ai/arandu-llama/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tayi-ai/arandu-llama/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/tayi-ai/arandu-llama/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/tayi-ai/arandu-llama/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/tayi-ai/arandu-llama/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/tayi-ai/arandu-llama/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/tayi-ai/arandu-llama/releases/tag/v0.2.0

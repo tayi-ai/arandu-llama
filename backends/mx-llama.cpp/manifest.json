@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "backend": "mx-llama.cpp",
+  "repository": "https://github.com/mxxm-t/mx-llama.cpp",
+  "revision": "a245214d8df6304762c7688c6b8ee45652c5c8e5",
+  "runtime_digest": "8e3296f980b6a01e3933ce6fba2e77c933df112a0bbc419acb4a22b724a8c8d0",
+  "license": "MIT",
+  "toolchain": {
+    "cuda_architectures": "75",
+    "build_type": "Release",
+    "ggml_cuda": true,
+    "ggml_rpc": true,
+    "ggml_native": false,
+    "llama_curl": false,
+    "ggml_sched_max_backends": 64
+  },
+  "binaries": {
+    "llama-cli": "604a5ad57e3545e1ff4e119bc78a280a98075a59c228305e21dce41c38791fb9",
+    "llama-server": "482302ee1b9f9145da85c753231399de423021213b071d32eb75cf8fba88f438",
+    "ggml-rpc-server": "182a313ddef3c90703a6d38cd90dc66bfccf4aeabbc93cdd85494eabf0332dd5"
+  }
+}

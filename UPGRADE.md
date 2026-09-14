@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## v0.4.0
+
+The existing in-process llama.cpp engine remains the default and its setup does
+not change. The `github.com/tayi-ai/arandu-llama/backends/mx` package is opt-in:
+construct its backend with absolute
+runtime and model cache roots, install the three binaries whose hashes appear
+in `backends/mx-llama.cpp/manifest.json`, and preserve the model `SHA256SUMS`
+file beside its shards. The backend refuses a different build or model before
+creating a process specification.
+
+`Model.CaptureLoRA` is additive. It creates a temporary context for one measured
+projection and can force device synchronization while it observes the graph;
+keep it in qualification and debugging paths rather than latency-sensitive
+inference.
+
+## v0.3.1
+
+`Score` can now return an error when the reported mean equals
+`log(n_vocab)`. Treat that refusal as an invalid forward pass and rerun on the
+qualified single-device path; do not store the uniform value as a model loss.
+
+## v0.3.0
+
+`Context.CaptureFinal` is additive. Stored captures should use both
+`TokenDigest` and `SnapshotDigest` in their identity so readings made under
+different token positions, quantisations or adapter policies cannot collide.
+
+## v0.2.1
+
+No API migration is required. Worker creation failures are returned to the
+caller instead of terminating the process.
+
 ## v0.2.0
 
 Nothing to upgrade from. This is the first release of this repository.
@@ -88,4 +120,3 @@ Framework `v0.46.4` and Hesape `v0.37.0` refuse a publication that carries the
 reserved name, so a package that has not moved fails its own tests with a
 message naming both rules, rather than failing in the first project that
 installs it.
-
