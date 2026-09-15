@@ -169,3 +169,26 @@ d24832f4c2f42340d5d4bf4d9b3277c861e0a0a9ccd25e94bda5581c5351f960  DeepSeek-V4.1-
 		t.Fatalf("mutated Q2 manifest refusal = %v", err)
 	}
 }
+
+func TestModelRecipeIsRecoveredOnlyFromPinnedManifestDigest(t *testing.T) {
+	q4 := AdmittedMXManifest()
+	q2, err := AdmittedMXManifestFor(MXModelQ2K)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		digest string
+		want   MXModelRecipe
+	}{{q4.ModelDigest, MXModelMXFP4}, {q2.ModelDigest, MXModelQ2K}} {
+		got, err := MXModelRecipeForDigest(tc.digest)
+		if err != nil || got != tc.want {
+			t.Fatalf("recipe for %s = %q, %v; want %q", tc.digest, got, err, tc.want)
+		}
+	}
+	if _, err := MXModelRecipeForDigest(""); err == nil {
+		t.Fatal("empty model digest was admitted")
+	}
+	if _, err := MXModelRecipeForDigest("not-admitted"); err == nil {
+		t.Fatal("unknown model digest was admitted")
+	}
+}

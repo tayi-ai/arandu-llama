@@ -114,6 +114,29 @@ func AdmittedMXManifestFor(recipe MXModelRecipe) (MXManifest, error) {
 	}, nil
 }
 
+// MXModelRecipeForDigest returns the unique admitted recipe for a persisted
+// model manifest digest. This lets durable jobs reconstruct the representation
+// without accepting a path or an unpinned name from a retry.
+func MXModelRecipeForDigest(digest string) (MXModelRecipe, error) {
+	if strings.TrimSpace(digest) == "" {
+		return "", errors.New("llama: MX model digest is required")
+	}
+	var found MXModelRecipe
+	for recipe, model := range mxModels {
+		if model.Manifest != digest {
+			continue
+		}
+		if found != "" {
+			return "", errors.New("llama: MX model digest is ambiguous")
+		}
+		found = recipe
+	}
+	if found == "" {
+		return "", errors.New("llama: MX model digest is not admitted")
+	}
+	return found, nil
+}
+
 func admittedMXModel(recipe MXModelRecipe) (mxModelIdentity, error) {
 	if recipe == "" {
 		recipe = MXModelMXFP4
