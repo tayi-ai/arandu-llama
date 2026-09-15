@@ -29,16 +29,26 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$TAG")"
+          # The module intentionally does not ship compiled archives. Build the
+          # pinned CPU archives from the tag checkout, then inject only those
+          # generated libraries into the extracted tag for linked verification.
+          git submodule update --init llama.cpp
+          make -j2 libbinding.a
+
           archive="$RUNNER_TEMP/package-llama"
           mkdir -p "$archive"
           git archive "$TAG" | tar -x -C "$archive"
+          cp libbinding.a libllama-common.a libllama-common-base.a libllama.a \
+             libggml-cpu.a libggml.a libggml-base.a "$archive/"
           cd "$archive"
           unformatted=$(find . -name '*.go' -not -path '*/testdata/*' \
                           -not -name '*.kyse.go' -exec gofmt -l {} +)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
           GOWORK=off go build ./...
           GOWORK=off go vet ./...
-          GOWORK=off go vet configure.go
+          if [ -f configure.go ]; then
+            GOWORK=off go vet configure.go
+          fi
           GOWORK=off go test -race -count=1 ./...
 
       - name: Audit known vulnerabilities

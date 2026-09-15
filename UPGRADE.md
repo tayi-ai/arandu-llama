@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.5.0
+
+The existing Q4 MX recipe remains the default. Q2 callers must select
+`deepseek-v4.1-flash-q2_k` explicitly and materialize the exact seven-shard
+manifest admitted by that recipe. Persist the recipe digest with the execution;
+`MXModelRecipeForDigest` can recover only a uniquely admitted digest and rejects
+unknown or ambiguous values.
+
+No change is required for applications that continue to use the Q4 recipe or
+the in-process llama.cpp binding.
+
 ## v0.4.0
 
 The existing in-process llama.cpp engine remains the default and its setup does

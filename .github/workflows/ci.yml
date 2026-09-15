@@ -45,6 +45,11 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: build native CPU archives for linked tests
+        run: |
+          git submodule update --init llama.cpp
+          make -j2 libbinding.a
+
       - name: test
         run: go test -race ./...
 

@@ -10,6 +10,23 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-15
+
+### Added
+
+- A pinned `deepseek-v4.1-flash-q2_k` MX recipe for the seven-shard Q2_K
+  runtime candidate, with exact revision, 264,515,279,456-byte manifest, and
+  model digest while keeping the qualified Q4 recipe as the default.
+- `MXModelRecipeForDigest` recovers an admitted model recipe from its persisted
+  model digest and rejects empty, unknown, or ambiguous identities.
+
+### Fixed
+
+- CI now builds the pinned CPU llama.cpp archives before tests that link the
+  in-process cgo binding. The release verifier does the same outside the tagged
+  archive, then copies only generated archives into the verification tree.
+- Release verification no longer assumes a package-local `configure.go` exists.
+
 ## [0.4.0] - 2026-09-13
 
 ### Added
@@ -104,7 +121,8 @@ code and must never be tagged again.**
   plausible number can come out wrong.
 - `.agents/skills/` — six procedures, one per situation.
 
-[Unreleased]: https://github.com/tayi-ai/arandu-llama/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/tayi-ai/arandu-llama/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/tayi-ai/arandu-llama/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tayi-ai/arandu-llama/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/tayi-ai/arandu-llama/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tayi-ai/arandu-llama/compare/v0.2.1...v0.3.0
