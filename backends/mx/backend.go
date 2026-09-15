@@ -20,15 +20,50 @@ import (
 const MXBackendID = "mx-llama.cpp"
 
 const (
-	mxRevision          = "a245214d8df6304762c7688c6b8ee45652c5c8e5"
-	mxRPCDigest         = "182a313ddef3c90703a6d38cd90dc66bfccf4aeabbc93cdd85494eabf0332dd5"
-	mxCLIDigest         = "604a5ad57e3545e1ff4e119bc78a280a98075a59c228305e21dce41c38791fb9"
-	mxServerDigest      = "482302bc25ca9b2ee5b1cc1532508ab9ea62d22f841caa9846eadd576f72eccc"
-	mxLibLlamaDigest    = "92cb8adca8177feb417a9c3aee856ee1a72f1390f387459b9a533fd52c0408ad"
-	mxRuntimeDigest     = "77c0d31dcf59a4798289f90279f3e25668873edd059d7701b47b9d8a10d4a05d"
-	mxManifestDigest    = "919222563fbd153ccaff4b2a71ac74ae6f510093535ccb579109c1e490f412fa"
-	mxModelRelativePath = "DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf"
+	mxRevision       = "a245214d8df6304762c7688c6b8ee45652c5c8e5"
+	mxRPCDigest      = "182a313ddef3c90703a6d38cd90dc66bfccf4aeabbc93cdd85494eabf0332dd5"
+	mxCLIDigest      = "604a5ad57e3545e1ff4e119bc78a280a98075a59c228305e21dce41c38791fb9"
+	mxServerDigest   = "482302bc25ca9b2ee5b1cc1532508ab9ea62d22f841caa9846eadd576f72eccc"
+	mxLibLlamaDigest = "92cb8adca8177feb417a9c3aee856ee1a72f1390f387459b9a533fd52c0408ad"
+	mxRuntimeDigest  = "77c0d31dcf59a4798289f90279f3e25668873edd059d7701b47b9d8a10d4a05d"
 )
+
+// MXModelRecipe identifies one pinned model representation admitted by the
+// qualified MX runtime. The zero value intentionally resolves to MXModelMXFP4
+// so existing callers cannot switch representation by omission.
+type MXModelRecipe string
+
+const (
+	// MXModelMXFP4 is the qualified Q4-class production representation.
+	MXModelMXFP4 MXModelRecipe = "deepseek-v4.1-flash-mxfp4"
+	// MXModelQ2K is the pinned seven-shard Q2_K qualification representation.
+	MXModelQ2K MXModelRecipe = "deepseek-v4.1-flash-q2_k"
+)
+
+type mxModelIdentity struct {
+	Recipe       MXModelRecipe
+	Repository   string
+	Revision     string
+	Quantisation string
+	Manifest     string
+	FirstShard   string
+	Shards       int
+}
+
+var mxModels = map[MXModelRecipe]mxModelIdentity{
+	MXModelMXFP4: {
+		Recipe: MXModelMXFP4, Repository: "mxxm-t/DeepSeek-V4.1-Flash-GGUF",
+		Revision: "5eb2981a11649314db27c460f8d5b350fd0a1685", Quantisation: "MXFP4",
+		Manifest:   "919222563fbd153ccaff4b2a71ac74ae6f510093535ccb579109c1e490f412fa",
+		FirstShard: "DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf", Shards: 12,
+	},
+	MXModelQ2K: {
+		Recipe: MXModelQ2K, Repository: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
+		Revision: "58d8ac86298fdf85a2440defee08b1abcad32e45", Quantisation: "Q2_K",
+		Manifest:   "676c159423ab746ba1ce6036f072d84d977921276429927f336f58aefaea9999",
+		FirstShard: "DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf", Shards: 7,
+	},
+}
 
 // MXManifest identifies the source, build and executables admitted by this backend.
 type MXManifest struct {
@@ -39,23 +74,55 @@ type MXManifest struct {
 	SchedulerBackends  int
 	RuntimeDigest      string
 	ModelDigest        string
+	ModelRecipe        MXModelRecipe
+	ModelRepository    string
+	ModelRevision      string
+	ModelQuantisation  string
+	ModelFirstShard    string
+	ModelShards        int
 	Binaries           map[string]string
 	RuntimeEnvironment map[string]string
 }
 
-// AdmittedMXManifest returns the immutable identity accepted by this release.
+// AdmittedMXManifest returns the immutable Q4 identity accepted by existing callers.
 func AdmittedMXManifest() MXManifest {
+	m, _ := AdmittedMXManifestFor(MXModelMXFP4)
+	return m
+}
+
+// AdmittedMXManifestFor returns the immutable runtime and model identity for a
+// declared representation. Q2 must be selected explicitly; an unknown recipe
+// is refused rather than silently falling back to Q4.
+func AdmittedMXManifestFor(recipe MXModelRecipe) (MXManifest, error) {
+	model, err := admittedMXModel(recipe)
+	if err != nil {
+		return MXManifest{}, err
+	}
 	return MXManifest{
 		Backend: MXBackendID, Repository: "https://github.com/mxxm-t/mx-llama.cpp",
 		Revision: mxRevision, CUDAArchitecture: "75", SchedulerBackends: 64,
-		RuntimeDigest: mxRuntimeDigest, ModelDigest: mxManifestDigest,
+		RuntimeDigest: mxRuntimeDigest, ModelDigest: model.Manifest,
+		ModelRecipe: model.Recipe, ModelRepository: model.Repository,
+		ModelRevision: model.Revision, ModelQuantisation: model.Quantisation,
+		ModelFirstShard: model.FirstShard, ModelShards: model.Shards,
 		Binaries: map[string]string{
 			"llama-cli": mxCLIDigest, "llama-server": mxServerDigest,
 			"libllama.so.0.3.0": mxLibLlamaDigest,
 			"ggml-rpc-server":   mxRPCDigest,
 		},
 		RuntimeEnvironment: map[string]string{"GGML_CUDA_Q8_1_CACHE": "0"},
+	}, nil
+}
+
+func admittedMXModel(recipe MXModelRecipe) (mxModelIdentity, error) {
+	if recipe == "" {
+		recipe = MXModelMXFP4
 	}
+	model, ok := mxModels[recipe]
+	if !ok {
+		return mxModelIdentity{}, fmt.Errorf("llama: MX model recipe %q is not admitted", recipe)
+	}
+	return model, nil
 }
 
 // NativeProcess is one typed native invocation.
@@ -73,12 +140,14 @@ type NativeProcess struct {
 type MXConfig struct {
 	RuntimeRoot string
 	ModelRoot   string
+	ModelRecipe MXModelRecipe
 }
 
 // MXBackend resolves and verifies one installed mx-llama.cpp release.
 type MXBackend struct {
 	runtimeRoot string
 	modelRoot   string
+	model       mxModelIdentity
 }
 
 // NewMXBackend verifies the runtime identity before returning a backend.
@@ -86,8 +155,16 @@ func NewMXBackend(cfg MXConfig) (*MXBackend, error) {
 	if !filepath.IsAbs(cfg.RuntimeRoot) || !filepath.IsAbs(cfg.ModelRoot) {
 		return nil, errors.New("llama: MX runtime and model roots have to be absolute")
 	}
-	b := &MXBackend{runtimeRoot: filepath.Clean(cfg.RuntimeRoot), modelRoot: filepath.Clean(cfg.ModelRoot)}
-	for name, want := range AdmittedMXManifest().Binaries {
+	model, err := admittedMXModel(cfg.ModelRecipe)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := AdmittedMXManifestFor(model.Recipe)
+	if err != nil {
+		return nil, err
+	}
+	b := &MXBackend{runtimeRoot: filepath.Clean(cfg.RuntimeRoot), modelRoot: filepath.Clean(cfg.ModelRoot), model: model}
+	for name, want := range manifest.Binaries {
 		if err := verifyFile(filepath.Join(b.runtimeRoot, "bin", name), want); err != nil {
 			return nil, fmt.Errorf("llama: verify MX %s: %w", name, err)
 		}
@@ -257,10 +334,10 @@ func (b *MXBackend) generateProcess(model string, in MXGenerateRequest) NativePr
 }
 
 func (b *MXBackend) admittedModel() (string, error) {
-	if err := verifyFile(filepath.Join(b.modelRoot, "SHA256SUMS"), mxManifestDigest); err != nil {
-		return "", fmt.Errorf("llama: verify MX model manifest: %w", err)
+	if err := verifyFile(filepath.Join(b.modelRoot, "SHA256SUMS"), b.model.Manifest); err != nil {
+		return "", fmt.Errorf("llama: verify MX model manifest for %s: %w", b.model.Recipe, err)
 	}
-	model := filepath.Join(b.modelRoot, mxModelRelativePath)
+	model := filepath.Join(b.modelRoot, b.model.FirstShard)
 	if info, err := os.Stat(model); err != nil || !info.Mode().IsRegular() {
 		return "", errors.New("llama: admitted MX model shard is absent")
 	}
