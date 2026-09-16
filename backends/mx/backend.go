@@ -36,8 +36,11 @@ type MXModelRecipe string
 const (
 	// MXModelMXFP4 is the qualified Q4-class production representation.
 	MXModelMXFP4 MXModelRecipe = "deepseek-v4.1-flash-mxfp4"
-	// MXModelQ2K is the pinned seven-shard Q2_K qualification representation.
+	// MXModelQ2K is the pinned seven-shard external Q2_K qualification control.
 	MXModelQ2K MXModelRecipe = "deepseek-v4.1-flash-q2_k"
+	// MXModelTayiQ2Progressive is the twelve-shard Tayi Q4 -> Q2_K base
+	// materialized for Q2 adaptation. It is distinct from the external control.
+	MXModelTayiQ2Progressive MXModelRecipe = "tayi-flash-q2-progressive"
 )
 
 type mxModelIdentity struct {
@@ -62,6 +65,12 @@ var mxModels = map[MXModelRecipe]mxModelIdentity{
 		Revision: "58d8ac86298fdf85a2440defee08b1abcad32e45", Quantisation: "Q2_K",
 		Manifest:   "676c159423ab746ba1ce6036f072d84d977921276429927f336f58aefaea9999",
 		FirstShard: "DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf", Shards: 7,
+	},
+	MXModelTayiQ2Progressive: {
+		Recipe: MXModelTayiQ2Progressive, Repository: "tayi-ai/Tayi-Flash-Q4",
+		Revision: "cc8df025f39b77fe788221349447e865f70991a3", Quantisation: "Q2_K",
+		Manifest:   "b24af56efc29d742065e1a76c3b99e6af5e74df822c2bb8b7fac7b64b5057f50",
+		FirstShard: "Tayi-Flash-Q2-Q2_K-00001-of-00012.gguf", Shards: 12,
 	},
 }
 
