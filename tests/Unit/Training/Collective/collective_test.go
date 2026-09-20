@@ -80,7 +80,16 @@ func sameBits(a, b []float32) bool {
 }
 
 func TestTwentyOneRanksOrderedAndBitwiseBroadcastAcrossSteps(t *testing.T) {
-	const world, dimension, steps = 21, 1031, 2 // Exercise multiple wire chunks.
+	testRanksOrderedAndBitwiseBroadcastAcrossSteps(t, 21)
+}
+
+func TestTwentyRanksOrderedAndBitwiseBroadcastAcrossSteps(t *testing.T) {
+	testRanksOrderedAndBitwiseBroadcastAcrossSteps(t, 20)
+}
+
+func testRanksOrderedAndBitwiseBroadcastAcrossSteps(t *testing.T, world uint32) {
+	t.Helper()
+	const dimension, steps = 1031, 2 // Exercise multiple wire chunks.
 	listener := newListener()
 	gradients := func(rank, step uint32) []float32 {
 		values := make([]float32, dimension)
@@ -92,7 +101,7 @@ func TestTwentyOneRanksOrderedAndBitwiseBroadcastAcrossSteps(t *testing.T) {
 	var calls atomic.Int32
 	coordinator, err := collective.NewCoordinator(listener, specification(world, 0, dimension, steps), func(all [][]float32) ([]float32, error) {
 		step := uint32(calls.Add(1))
-		if len(all) != world {
+		if len(all) != int(world) {
 			t.Errorf("got %d ranks", len(all))
 		}
 		result := make([]float32, dimension)
