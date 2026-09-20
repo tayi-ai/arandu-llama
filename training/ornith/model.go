@@ -97,6 +97,15 @@ func (g Gradients) Close() error {
 // template. Each decoder output is detached; only boundary activations survive.
 // The caller supplies the exact tokenizer output and any appended answer token.
 func (m *TextModel) Forward(ctx context.Context, tokenIDs []int64, limits Limits) (_ *Snapshot, err error) {
+	return m.ForwardObserved(ctx, tokenIDs, limits, nil)
+}
+
+// ForwardObserved performs Forward with optional synchronous observations of
+// copied activation statistics. A nil observer adds no tensor reads. Observing
+// synchronizes native copies and can change timing; it does not change tensor
+// values, precision, model parameters or allocation admission. Observer errors
+// stop the forward and release its intermediate handles.
+func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limits Limits, observer ForwardObserver) (_ *Snapshot, err error) {
 	info, err := m.validate(ctx, tokenIDs, limits)
 	if err != nil {
 		return nil, err
@@ -126,8 +135,14 @@ func (m *TextModel) Forward(ctx context.Context, tokenIDs []int64, limits Limits
 			_ = snapshot.Close()
 		}
 	}()
+	if err = observeForward(ctx, observer, StageEmbedding, -1, current); err != nil {
+		return nil, err
+	}
 	for index, layer := range m.Layers {
 		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err = observeForward(ctx, observer, StageBeforePlacement, index, current); err != nil {
 			return nil, err
 		}
 		placed, err := current.To(layer.Device, info.DType)
@@ -136,9 +151,15 @@ func (m *TextModel) Forward(ctx context.Context, tokenIDs []int64, limits Limits
 		}
 		_ = current.Close()
 		snapshot.states = append(snapshot.states, placed)
+		if err = observeForward(ctx, observer, StageAfterPlacement, index, placed); err != nil {
+			return nil, err
+		}
 		current, err = layers.DecoderForward(ctx, placed, layer.Weights, layer.Adapter, layer.Cosine, layer.Sine, layer.Config)
 		if err != nil {
 			return nil, fmt.Errorf("ornith: layer %d forward: %w", index, err)
+		}
+		if err = observeForward(ctx, observer, StageAfterDecoder, index, current); err != nil {
+			return nil, err
 		}
 	}
 	final, err := current.Detach()
@@ -146,13 +167,16 @@ func (m *TextModel) Forward(ctx context.Context, tokenIDs []int64, limits Limits
 		return nil, err
 	}
 	snapshot.states = append(snapshot.states, final)
-	logits, err := m.head(final, limits.LogitRows)
+	logits, err := m.headObserved(ctx, final, limits.LogitRows, observer)
 	if err != nil {
 		return nil, err
 	}
 	defer logits.Close()
 	snapshot.Logits, err = logits.Detach()
 	if err != nil {
+		return nil, err
+	}
+	if err = observeForward(ctx, observer, StageLogits, -1, snapshot.Logits); err != nil {
 		return nil, err
 	}
 	finite, err := snapshot.Logits.AllFinite()
@@ -275,6 +299,10 @@ func (m *TextModel) VJP(ctx context.Context, snapshot *Snapshot, logitCotangent 
 }
 
 func (m *TextModel) head(hidden *torch.Tensor, count int64) (*torch.Tensor, error) {
+	return m.headObserved(nil, hidden, count, nil)
+}
+
+func (m *TextModel) headObserved(ctx context.Context, hidden *torch.Tensor, count int64, observer ForwardObserver) (*torch.Tensor, error) {
 	info, err := hidden.Info()
 	if err != nil {
 		return nil, err
@@ -284,6 +312,9 @@ func (m *TextModel) head(hidden *torch.Tensor, count int64) (*torch.Tensor, erro
 		return nil, err
 	}
 	defer normalized.Close()
+	if err = observeForward(ctx, observer, StageFinalNorm, -1, normalized); err != nil {
+		return nil, err
+	}
 	last, err := normalized.Slice(1, info.Shape[1]-count, info.Shape[1], 1)
 	if err != nil {
 		return nil, err
