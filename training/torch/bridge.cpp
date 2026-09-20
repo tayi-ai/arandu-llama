@@ -198,8 +198,8 @@ extern "C" tayi_torch_result tayi_torch_apply(int operation, tayi_torch_tensor *
                 // direct peer copy. Stage only cross-GPU placement through
                 // host memory; both copies remain in the autograd graph.
                 if (a.device().is_cuda() && destination.is_cuda() && a.device() != destination) {
-                    auto host = a.to(torch::TensorOptions().device(torch::kCPU).dtype(dtype), false, true);
-                    output = host.to(torch::TensorOptions().device(destination).dtype(dtype), false, true);
+                    auto host = a.to(torch::TensorOptions().device(torch::kCPU).dtype(dtype), false, false);
+                    output = host.to(torch::TensorOptions().device(destination).dtype(dtype), false, false);
                 } else {
                     output = a.to(torch::TensorOptions().device(destination).dtype(dtype), false, false);
                 }

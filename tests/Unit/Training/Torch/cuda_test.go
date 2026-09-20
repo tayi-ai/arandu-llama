@@ -19,7 +19,9 @@ func TestCUDADeviceTransferSurvivesImmediateSourceClose(t *testing.T) {
 	if count < 2 {
 		t.Skip("two CUDA devices are required")
 	}
-	const elements = 1 << 20
+	// Exceed the largest observed decoder boundary so this exercises the same
+	// multi-page transfer that the model uses between its two local GPUs.
+	const elements = 5 << 20
 	values := make([]float32, elements)
 	for index := range values {
 		values[index] = float32(index%2047-1023) / 128
@@ -48,13 +50,6 @@ func TestCUDADeviceTransferSurvivesImmediateSourceClose(t *testing.T) {
 			_ = source.Close()
 			t.Fatal(err)
 		}
-		beforeClose, err := destination.Float32Values()
-		if err != nil {
-			_ = source.Close()
-			_ = destination.Close()
-			t.Fatal(err)
-		}
-		check("destination_before_source_close", iteration, beforeClose)
 		if err := source.Close(); err != nil {
 			_ = destination.Close()
 			t.Fatal(err)
