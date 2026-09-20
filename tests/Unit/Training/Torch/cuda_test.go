@@ -24,16 +24,37 @@ func TestCUDADeviceTransferSurvivesImmediateSourceClose(t *testing.T) {
 	for index := range values {
 		values[index] = float32(index%2047-1023) / 128
 	}
+	check := func(stage string, iteration int, actual []float32) {
+		t.Helper()
+		for index := range values {
+			if math.Float32bits(actual[index]) != math.Float32bits(values[index]) {
+				t.Fatalf("%s iteration %d index %d: got %g want exactly %g", stage, iteration, index, actual[index], values[index])
+			}
+		}
+	}
 	for iteration := range 8 {
 		source, err := torch.FromFloat32(values, []int64{elements}, torch.CUDADevice(0), false)
 		if err != nil {
 			t.Fatal(err)
 		}
+		sourceValues, err := source.Float32Values()
+		if err != nil {
+			_ = source.Close()
+			t.Fatal(err)
+		}
+		check("source", iteration, sourceValues)
 		destination, err := source.To(torch.CUDADevice(1), torch.Float32)
 		if err != nil {
 			_ = source.Close()
 			t.Fatal(err)
 		}
+		beforeClose, err := destination.Float32Values()
+		if err != nil {
+			_ = source.Close()
+			_ = destination.Close()
+			t.Fatal(err)
+		}
+		check("destination_before_source_close", iteration, beforeClose)
 		if err := source.Close(); err != nil {
 			_ = destination.Close()
 			t.Fatal(err)
@@ -45,11 +66,7 @@ func TestCUDADeviceTransferSurvivesImmediateSourceClose(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for index := range values {
-			if math.Float32bits(actual[index]) != math.Float32bits(values[index]) {
-				t.Fatalf("iteration %d index %d: got %g want exactly %g", iteration, index, actual[index], values[index])
-			}
-		}
+		check("destination", iteration, actual)
 	}
 }
 
