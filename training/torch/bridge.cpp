@@ -191,8 +191,12 @@ extern "C" tayi_torch_result tayi_torch_apply(int operation, tayi_torch_tensor *
             case 14: output = torch::softplus(a, 1, 20); break;
             case 15: output = a.rsqrt(); break;
             case 16: output = a.softmax(integer(0)); break;
+            // Keep device transfers synchronous. The Go owner may close the
+            // source handle immediately after To returns, so a non-blocking
+            // copy can let the CUDA allocator reuse its storage before the
+            // destination has consumed it.
             case 17: output = a.to(torch::TensorOptions().device(device_type(static_cast<int>(integer(0))))
-                .dtype(scalar_type(static_cast<int>(integer(1)))), false, true); break;
+                .dtype(scalar_type(static_cast<int>(integer(1)))), false, false); break;
             case 18: output = a.clone(); break;
             case 19: output = a.detach(); break;
             case 20: output = a; output.requires_grad_(integer(0) != 0); break;
