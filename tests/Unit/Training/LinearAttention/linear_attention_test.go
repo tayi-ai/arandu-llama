@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -395,6 +396,16 @@ func TestCancellationDuringProjectionPreservesBorrowedTensors(t *testing.T) {
 		if !reflect.DeepEqual(read(t, x), f.x) || !reflect.DeepEqual(read(t, w.QKV), f.qkv) {
 			t.Fatal("cancellation mutated borrowed tensors")
 		}
+	}
+}
+
+func TestFiniteProjectionOverflowNamesItsStage(t *testing.T) {
+	f := newFixture()
+	x, w := f.tensors(t, false)
+	w.ALog = tensor(t, []float32{0, 0, 1000, 0}, []int64{4}, false)
+	value, err := layers.ForwardLinearAttention(context.Background(), x, w, f.config)
+	if value != nil || err == nil || !strings.Contains(err.Error(), "negative_a_exp") {
+		t.Fatalf("overflow stage = value %v error %v", value, err)
 	}
 }
 

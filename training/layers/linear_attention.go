@@ -146,6 +146,10 @@ func (s *linearAttentionScope) check() bool {
 }
 
 func (s *linearAttentionScope) finite(value *torch.Tensor) {
+	s.finiteNamed("unlabeled", value)
+}
+
+func (s *linearAttentionScope) finiteNamed(name string, value *torch.Tensor) {
 	if !s.check() {
 		return
 	}
@@ -153,18 +157,22 @@ func (s *linearAttentionScope) finite(value *torch.Tensor) {
 	if err != nil {
 		s.err = err
 	} else if !finite {
-		s.err = errors.New("layers: nonfinite linear-attention intermediate")
+		s.err = errors.New("layers: nonfinite linear-attention intermediate: " + name)
 	}
 	s.check()
 }
 
 func (s *linearAttentionScope) run(operation func() (*torch.Tensor, error)) *torch.Tensor {
+	return s.runNamed("unlabeled", operation)
+}
+
+func (s *linearAttentionScope) runNamed(name string, operation func() (*torch.Tensor, error)) *torch.Tensor {
 	if !s.check() {
 		return nil
 	}
 	value := s.scope.run(operation)
 	if s.err == nil {
-		s.finite(value)
+		s.finiteNamed(name, value)
 	}
 	return value
 }
@@ -320,7 +328,7 @@ func linearAttentionProduct(dimensions ...int64) (int64, error) {
 }
 
 func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights LinearAttentionWeights, geometry linearAttentionGeometry, config LinearAttentionConfig) (tensor.Input, *torch.Tensor) {
-	mixed := s.run(func() (*torch.Tensor, error) { return Linear(x, weights.QKV) })
+	mixed := s.runNamed("qkv_projection", func() (*torch.Tensor, error) { return Linear(x, weights.QKV) })
 	var convolution *torch.Tensor
 	for tap := int64(0); tap < 4 && s.check(); tap++ {
 		lag := 3 - tap
@@ -329,80 +337,80 @@ func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights Li
 		}
 		shifted := mixed
 		if lag > 0 {
-			prefix := s.run(func() (*torch.Tensor, error) { return mixed.Slice(1, 0, lag, 1) })
-			prefix = s.run(func() (*torch.Tensor, error) { return prefix.Scale(0) })
-			past := s.run(func() (*torch.Tensor, error) { return mixed.Slice(1, 0, geometry.tokens-lag, 1) })
-			shifted = s.run(func() (*torch.Tensor, error) { return torch.Cat([]*torch.Tensor{prefix, past}, 1) })
+			prefix := s.runNamed("convolution_prefix_slice", func() (*torch.Tensor, error) { return mixed.Slice(1, 0, lag, 1) })
+			prefix = s.runNamed("convolution_prefix_zero", func() (*torch.Tensor, error) { return prefix.Scale(0) })
+			past := s.runNamed("convolution_past_slice", func() (*torch.Tensor, error) { return mixed.Slice(1, 0, geometry.tokens-lag, 1) })
+			shifted = s.runNamed("convolution_shift", func() (*torch.Tensor, error) { return torch.Cat([]*torch.Tensor{prefix, past}, 1) })
 		}
-		kernel := s.run(func() (*torch.Tensor, error) { return weights.Convolution.Select(1, 0) })
-		kernel = s.run(func() (*torch.Tensor, error) { return kernel.Select(1, tap) })
-		term := s.run(func() (*torch.Tensor, error) { return shifted.Mul(kernel) })
+		kernel := s.runNamed("convolution_kernel_channel", func() (*torch.Tensor, error) { return weights.Convolution.Select(1, 0) })
+		kernel = s.runNamed("convolution_kernel_tap", func() (*torch.Tensor, error) { return kernel.Select(1, tap) })
+		term := s.runNamed("convolution_term", func() (*torch.Tensor, error) { return shifted.Mul(kernel) })
 		if convolution == nil {
 			convolution = term
 		} else {
-			convolution = s.run(func() (*torch.Tensor, error) { return convolution.Add(term) })
+			convolution = s.runNamed("convolution_accumulate", func() (*torch.Tensor, error) { return convolution.Add(term) })
 		}
 	}
-	convolution = s.run(func() (*torch.Tensor, error) { return convolution.SiLU() })
-	query := s.run(func() (*torch.Tensor, error) { return convolution.Slice(2, 0, geometry.keys, 1) })
-	key := s.run(func() (*torch.Tensor, error) { return convolution.Slice(2, geometry.keys, 2*geometry.keys, 1) })
-	value := s.run(func() (*torch.Tensor, error) { return convolution.Slice(2, 2*geometry.keys, geometry.channels, 1) })
-	query = s.run(func() (*torch.Tensor, error) {
+	convolution = s.runNamed("convolution_silu", func() (*torch.Tensor, error) { return convolution.SiLU() })
+	query := s.runNamed("query_slice", func() (*torch.Tensor, error) { return convolution.Slice(2, 0, geometry.keys, 1) })
+	key := s.runNamed("key_slice", func() (*torch.Tensor, error) { return convolution.Slice(2, geometry.keys, 2*geometry.keys, 1) })
+	value := s.runNamed("value_slice", func() (*torch.Tensor, error) { return convolution.Slice(2, 2*geometry.keys, geometry.channels, 1) })
+	query = s.runNamed("query_reshape", func() (*torch.Tensor, error) {
 		return query.Reshape([]int64{geometry.batch, geometry.tokens, config.KeyHeads, config.KeyDimension})
 	})
-	key = s.run(func() (*torch.Tensor, error) {
+	key = s.runNamed("key_reshape", func() (*torch.Tensor, error) {
 		return key.Reshape([]int64{geometry.batch, geometry.tokens, config.KeyHeads, config.KeyDimension})
 	})
-	value = s.run(func() (*torch.Tensor, error) {
+	value = s.runNamed("value_reshape", func() (*torch.Tensor, error) {
 		return value.Reshape([]int64{geometry.batch, geometry.tokens, config.ValueHeads, config.ValueDimension})
 	})
-	epsilon := s.run(func() (*torch.Tensor, error) {
+	epsilon := s.runNamed("normalization_epsilon", func() (*torch.Tensor, error) {
 		return torch.FromFloat32([]float32{1e-6}, []int64{1}, geometry.device, false)
 	})
-	normalize := func(input *torch.Tensor) *torch.Tensor {
-		squares := s.run(func() (*torch.Tensor, error) { return input.Mul(input) })
-		squares = s.run(func() (*torch.Tensor, error) { return squares.Sum([]int64{-1}, true) })
-		squares = s.run(func() (*torch.Tensor, error) { return squares.Add(epsilon) })
-		inverse := s.run(func() (*torch.Tensor, error) { return squares.RSqrt() })
-		return s.run(func() (*torch.Tensor, error) { return input.Mul(inverse) })
+	normalize := func(name string, input *torch.Tensor) *torch.Tensor {
+		squares := s.runNamed(name+"_square", func() (*torch.Tensor, error) { return input.Mul(input) })
+		squares = s.runNamed(name+"_square_sum", func() (*torch.Tensor, error) { return squares.Sum([]int64{-1}, true) })
+		squares = s.runNamed(name+"_epsilon", func() (*torch.Tensor, error) { return squares.Add(epsilon) })
+		inverse := s.runNamed(name+"_rsqrt", func() (*torch.Tensor, error) { return squares.RSqrt() })
+		return s.runNamed(name+"_normalized", func() (*torch.Tensor, error) { return input.Mul(inverse) })
 	}
-	query, key = normalize(query), normalize(key)
+	query, key = normalize("query", query), normalize("key", key)
 	if config.ValueHeads != config.KeyHeads {
-		repeat := func(input *torch.Tensor) *torch.Tensor {
+		repeat := func(name string, input *torch.Tensor) *torch.Tensor {
 			parts := make([]*torch.Tensor, 0, config.ValueHeads)
 			for head := int64(0); head < config.KeyHeads && s.check(); head++ {
-				part := s.run(func() (*torch.Tensor, error) { return input.Select(2, head) })
+				part := s.runNamed(name+"_head_select", func() (*torch.Tensor, error) { return input.Select(2, head) })
 				for count := int64(0); count < config.ValueHeads/config.KeyHeads; count++ {
 					parts = append(parts, part)
 				}
 			}
-			return s.run(func() (*torch.Tensor, error) { return torch.Stack(parts, 2) })
+			return s.runNamed(name+"_head_repeat", func() (*torch.Tensor, error) { return torch.Stack(parts, 2) })
 		}
-		query, key = repeat(query), repeat(key)
+		query, key = repeat("query", query), repeat("key", key)
 	}
-	query = s.run(func() (*torch.Tensor, error) { return query.Scale(1 / math.Sqrt(float64(config.KeyDimension))) })
-	beta := s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Beta) })
-	beta = s.run(func() (*torch.Tensor, error) { return beta.Sigmoid() })
-	decay := s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Alpha) })
-	decay = s.run(func() (*torch.Tensor, error) { return decay.Add(weights.DTBias) })
-	decay = s.run(func() (*torch.Tensor, error) { return decay.Softplus() })
-	negativeA := s.run(func() (*torch.Tensor, error) { return weights.ALog.Exp() })
-	negativeA = s.run(func() (*torch.Tensor, error) { return negativeA.Scale(-1) })
-	decay = s.run(func() (*torch.Tensor, error) { return decay.Mul(negativeA) })
-	gate := s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Z) })
-	gate = s.run(func() (*torch.Tensor, error) {
+	query = s.runNamed("query_scale", func() (*torch.Tensor, error) { return query.Scale(1 / math.Sqrt(float64(config.KeyDimension))) })
+	beta := s.runNamed("beta_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Beta) })
+	beta = s.runNamed("beta_sigmoid", func() (*torch.Tensor, error) { return beta.Sigmoid() })
+	decay := s.runNamed("decay_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Alpha) })
+	decay = s.runNamed("decay_bias", func() (*torch.Tensor, error) { return decay.Add(weights.DTBias) })
+	decay = s.runNamed("decay_softplus", func() (*torch.Tensor, error) { return decay.Softplus() })
+	negativeA := s.runNamed("negative_a_exp", func() (*torch.Tensor, error) { return weights.ALog.Exp() })
+	negativeA = s.runNamed("negative_a_scale", func() (*torch.Tensor, error) { return negativeA.Scale(-1) })
+	decay = s.runNamed("decay_log", func() (*torch.Tensor, error) { return decay.Mul(negativeA) })
+	gate := s.runNamed("gate_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Z) })
+	gate = s.runNamed("gate_reshape", func() (*torch.Tensor, error) {
 		return gate.Reshape([]int64{geometry.batch, geometry.tokens, config.ValueHeads, config.ValueDimension})
 	})
-	initial := s.run(func() (*torch.Tensor, error) {
+	initial := s.runNamed("initial_state", func() (*torch.Tensor, error) {
 		return torch.FromFloat32(make([]float32, geometry.stateElements), []int64{geometry.batch, config.ValueHeads, config.KeyDimension, config.ValueDimension}, geometry.device, false)
 	})
 	return tensor.Input{Query: query, Key: key, Value: value, LogDecay: decay, Beta: beta, InitialState: initial}, gate
 }
 
 func finishLinearAttention(s *linearAttentionScope, core, gate *torch.Tensor, weights LinearAttentionWeights, geometry linearAttentionGeometry, config LinearAttentionConfig) *torch.Tensor {
-	value := s.run(func() (*torch.Tensor, error) { return GatedRMSNorm(core, weights.Norm, gate, config.Epsilon) })
-	value = s.run(func() (*torch.Tensor, error) {
+	value := s.runNamed("gated_rms_norm", func() (*torch.Tensor, error) { return GatedRMSNorm(core, weights.Norm, gate, config.Epsilon) })
+	value = s.runNamed("output_reshape", func() (*torch.Tensor, error) {
 		return value.Reshape([]int64{geometry.batch, geometry.tokens, geometry.values})
 	})
-	return s.run(func() (*torch.Tensor, error) { return Linear(value, weights.Output) })
+	return s.runNamed("output_projection", func() (*torch.Tensor, error) { return Linear(value, weights.Output) })
 }
