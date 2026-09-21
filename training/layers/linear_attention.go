@@ -2,6 +2,7 @@ package layers
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"math"
 
@@ -376,17 +377,19 @@ func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights Li
 	}
 	query, key = normalize("query", query), normalize("key", key)
 	if config.ValueHeads != config.KeyHeads {
-		repeat := func(name string, input *torch.Tensor) *torch.Tensor {
-			parts := make([]*torch.Tensor, 0, config.ValueHeads)
-			for head := int64(0); head < config.KeyHeads && s.check(); head++ {
-				part := s.runNamed(name+"_head_select", func() (*torch.Tensor, error) { return input.Select(2, head) })
-				for count := int64(0); count < config.ValueHeads/config.KeyHeads; count++ {
-					parts = append(parts, part)
-				}
+		repeatCount := config.ValueHeads / config.KeyHeads
+		indexBytes := make([]byte, config.ValueHeads*8)
+		for head := int64(0); head < config.KeyHeads; head++ {
+			for count := int64(0); count < repeatCount; count++ {
+				index := head*repeatCount + count
+				binary.LittleEndian.PutUint64(indexBytes[index*8:], uint64(head))
 			}
-			return s.runNamed(name+"_head_repeat", func() (*torch.Tensor, error) { return torch.Stack(parts, 2) })
 		}
-		query, key = repeat("query", query), repeat("key", key)
+		indices := s.runNamed("head_repeat_indices", func() (*torch.Tensor, error) {
+			return torch.FromBytes(indexBytes, []int64{config.ValueHeads}, torch.Int64, geometry.device, false)
+		})
+		query = s.runNamed("query_head_repeat", func() (*torch.Tensor, error) { return query.IndexSelect(2, indices) })
+		key = s.runNamed("key_head_repeat", func() (*torch.Tensor, error) { return key.IndexSelect(2, indices) })
 	}
 	query = s.runNamed("query_scale", func() (*torch.Tensor, error) { return query.Scale(1 / math.Sqrt(float64(config.KeyDimension))) })
 	beta := s.runNamed("beta_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Beta) })
