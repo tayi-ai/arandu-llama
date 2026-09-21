@@ -244,6 +244,9 @@ const (
 	opReciprocal
 	opCos
 	opSin
+	opAbs
+	opAMax
+	opClampMin
 )
 
 func apply(op operation, tensors []*Tensor, integers []int64, scalar float64) (*Tensor, error) {
@@ -389,6 +392,23 @@ func (t *Tensor) Cos() (*Tensor, error) { return apply(opCos, []*Tensor{t}, nil,
 
 // Sin computes elementwise sine in radians.
 func (t *Tensor) Sin() (*Tensor, error) { return apply(opSin, []*Tensor{t}, nil, 0) }
+
+// Abs computes the elementwise absolute value.
+func (t *Tensor) Abs() (*Tensor, error) { return apply(opAbs, []*Tensor{t}, nil, 0) }
+
+// AMax returns the maximum values across dimensions; an empty dimensions slice
+// reduces every dimension, matching Sum and Mean.
+func (t *Tensor) AMax(dimensions []int64, keepDim bool) (*Tensor, error) {
+	return reduction(opAMax, t, dimensions, keepDim)
+}
+
+// ClampMin replaces values below a finite scalar floor.
+func (t *Tensor) ClampMin(value float64) (*Tensor, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, errors.New("torch: clamp minimum must be finite")
+	}
+	return apply(opClampMin, []*Tensor{t}, nil, value)
+}
 
 // SiLU computes x times sigmoid(x).
 func (t *Tensor) SiLU() (*Tensor, error) { return apply(opSiLU, []*Tensor{t}, nil, 0) }

@@ -409,6 +409,75 @@ func TestFiniteProjectionOverflowNamesItsStage(t *testing.T) {
 	}
 }
 
+func TestLargeFiniteQueryUsesStableL2Normalization(t *testing.T) {
+	f := newFixture()
+	queryRows := f.kh * f.kd
+	for row := 0; row < queryRows; row++ {
+		for column := 0; column < f.hidden; column++ {
+			f.qkv[row*f.hidden+column] *= 1e20
+		}
+	}
+	x, w := f.tensors(t, true)
+	seedValues := data(len(f.x), 0.3, 0.7)
+	seed := tensor(t, seedValues, []int64{int64(f.batch), int64(f.tokens), int64(f.hidden)}, false)
+	value, err := layers.ForwardLinearAttention(context.Background(), x, w, f.config)
+	value = own(t, value, err)
+	gradient, err := layers.LinearAttentionVJP(context.Background(), x, w, seed, f.config)
+	gradient = own(t, gradient, err)
+	if finite, err := value.AllFinite(); err != nil || !finite {
+		t.Fatalf("large-query forward finite=%t err=%v", finite, err)
+	}
+	if finite, err := gradient.AllFinite(); err != nil || !finite {
+		t.Fatalf("large-query VJP finite=%t err=%v", finite, err)
+	}
+	near(t, read(t, value), f.oracle(doubles(f.x)), 5e-5)
+}
+
+func TestCUDALargeFiniteQueryUsesStableL2Normalization(t *testing.T) {
+	if !torch.CUDAEnabled() {
+		t.Skip("CUDA bridge is not enabled")
+	}
+	count, err := torch.CUDADeviceCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count < 1 {
+		t.Skip("one CUDA device is required")
+	}
+	f := newFixture()
+	queryRows := f.kh * f.kd
+	for row := 0; row < queryRows; row++ {
+		for column := 0; column < f.hidden; column++ {
+			f.qkv[row*f.hidden+column] *= 1e20
+		}
+	}
+	cpuX, cpuWeights := f.tensors(t, true)
+	device := torch.CUDADevice(0)
+	move := func(value *torch.Tensor) *torch.Tensor {
+		moved, err := value.To(device, torch.Float32)
+		return own(t, moved, err)
+	}
+	x := move(cpuX)
+	w := layers.LinearAttentionWeights{
+		QKV: move(cpuWeights.QKV), Z: move(cpuWeights.Z), Beta: move(cpuWeights.Beta), Alpha: move(cpuWeights.Alpha),
+		Convolution: move(cpuWeights.Convolution), ALog: move(cpuWeights.ALog), DTBias: move(cpuWeights.DTBias),
+		Norm: move(cpuWeights.Norm), Output: move(cpuWeights.Output),
+	}
+	seedCPU := tensor(t, data(len(f.x), 0.3, 0.7), []int64{int64(f.batch), int64(f.tokens), int64(f.hidden)}, false)
+	seed := move(seedCPU)
+	value, err := layers.ForwardLinearAttention(context.Background(), x, w, f.config)
+	value = own(t, value, err)
+	gradient, err := layers.LinearAttentionVJP(context.Background(), x, w, seed, f.config)
+	gradient = own(t, gradient, err)
+	if finite, err := value.AllFinite(); err != nil || !finite {
+		t.Fatalf("CUDA large-query forward finite=%t err=%v", finite, err)
+	}
+	if finite, err := gradient.AllFinite(); err != nil || !finite {
+		t.Fatalf("CUDA large-query VJP finite=%t err=%v", finite, err)
+	}
+	near(t, read(t, value), f.oracle(doubles(f.x)), 2e-4)
+}
+
 func TestValidationCancellationAndOverflowFailWithoutMutatingInputs(t *testing.T) {
 	f := newFixture()
 	x, w := f.tensors(t, true)

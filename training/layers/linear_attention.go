@@ -369,11 +369,22 @@ func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights Li
 		return torch.FromFloat32([]float32{1e-6}, []int64{1}, geometry.device, false)
 	})
 	normalize := func(name string, input *torch.Tensor) *torch.Tensor {
-		squares := s.runNamed(name+"_square", func() (*torch.Tensor, error) { return input.Mul(input) })
-		squares = s.runNamed(name+"_square_sum", func() (*torch.Tensor, error) { return squares.Sum([]int64{-1}, true) })
-		squares = s.runNamed(name+"_epsilon", func() (*torch.Tensor, error) { return squares.Add(epsilon) })
-		inverse := s.runNamed(name+"_rsqrt", func() (*torch.Tensor, error) { return squares.RSqrt() })
-		return s.runNamed(name+"_normalized", func() (*torch.Tensor, error) { return input.Mul(inverse) })
+		// Preserve x/sqrt(sum(x^2)+1e-6) while avoiding overflow when a
+		// finite FP32 projection is too large to square directly. Scaling by
+		// max(1,max(abs(x))) is algebraically cancelled by the denominator;
+		// epsilon is scaled by the same reciprocal squared.
+		magnitude := s.runNamed(name+"_abs", func() (*torch.Tensor, error) { return input.Abs() })
+		magnitude = s.runNamed(name+"_amax", func() (*torch.Tensor, error) { return magnitude.AMax([]int64{-1}, true) })
+		magnitude = s.runNamed(name+"_scale_floor", func() (*torch.Tensor, error) { return magnitude.ClampMin(1) })
+		scale := s.runNamed(name+"_scale_reciprocal", func() (*torch.Tensor, error) { return magnitude.Reciprocal() })
+		scaled := s.runNamed(name+"_scaled", func() (*torch.Tensor, error) { return input.Mul(scale) })
+		squares := s.runNamed(name+"_scaled_square", func() (*torch.Tensor, error) { return scaled.Mul(scaled) })
+		squares = s.runNamed(name+"_scaled_square_sum", func() (*torch.Tensor, error) { return squares.Sum([]int64{-1}, true) })
+		scaledEpsilon := s.runNamed(name+"_epsilon_scale_square", func() (*torch.Tensor, error) { return scale.Mul(scale) })
+		scaledEpsilon = s.runNamed(name+"_scaled_epsilon", func() (*torch.Tensor, error) { return scaledEpsilon.Mul(epsilon) })
+		squares = s.runNamed(name+"_stable_norm_square", func() (*torch.Tensor, error) { return squares.Add(scaledEpsilon) })
+		inverse := s.runNamed(name+"_stable_rsqrt", func() (*torch.Tensor, error) { return squares.RSqrt() })
+		return s.runNamed(name+"_normalized", func() (*torch.Tensor, error) { return scaled.Mul(inverse) })
 	}
 	query, key = normalize("query", query), normalize("key", key)
 	if config.ValueHeads != config.KeyHeads {

@@ -308,6 +308,9 @@ func TestNativeTensorOwnershipDTypesAndErrors(t *testing.T) {
 	if _, err := view.MatMul(empty); err == nil {
 		t.Fatal("matmul mismatch accepted")
 	}
+	if _, err := view.ClampMin(math.NaN()); err == nil {
+		t.Fatal("NaN clamp minimum accepted")
+	}
 	near(t, values(t, view), []float64{1, 3, 2, 4}, 0)
 }
 
@@ -320,6 +323,10 @@ func TestNativePrimitiveCompositionAndFiniteChecks(t *testing.T) {
 	near(t, values(t, keep(x.Mul(x))), []float64{1, 4, 9, 16}, 0)
 	near(t, values(t, keep(x.Sum([]int64{1}, true))), []float64{3, 7}, 0)
 	near(t, values(t, keep(x.Mean(nil, false))), []float64{2.5}, 0)
+	negative := keep(torch.FromFloat64([]float64{-4, 2, -3, 1}, []int64{2, 2}, torch.CPUDevice(), false))
+	near(t, values(t, keep(negative.Abs())), []float64{4, 2, 3, 1}, 0)
+	near(t, values(t, keep(keep(negative.Abs()).AMax([]int64{1}, true))), []float64{4, 3}, 0)
+	near(t, values(t, keep(negative.ClampMin(-1))), []float64{-1, 2, -1, 1}, 0)
 	near(t, values(t, keep(keep(x.Exp()).Log())), []float64{1, 2, 3, 4}, 1e-14)
 	near(t, values(t, keep(x.RSqrt())), []float64{1, 1 / math.Sqrt(2), 1 / math.Sqrt(3), .5}, 1e-14)
 	sigmoid := make([]float64, 4)

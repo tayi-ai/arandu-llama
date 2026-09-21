@@ -221,6 +221,16 @@ extern "C" tayi_torch_result tayi_torch_apply(int operation, tayi_torch_tensor *
             case 31: output = a.reciprocal(); break;
             case 32: output = a.cos(); break;
             case 33: output = a.sin(); break;
+            case 34: output = a.abs(); break;
+            case 35: {
+                const bool keep = integer(0) != 0;
+                std::vector<int64_t> dims;
+                if (integer_count > 1) dims.assign(integers + 1, integers + integer_count);
+                else for (int64_t i = 0; i < a.dim(); ++i) dims.push_back(i);
+                output = a.amax(dims, keep);
+                break;
+            }
+            case 36: output = a.clamp_min(scalar); break;
             default: throw std::invalid_argument("unknown native tensor operation");
         }
         if (output.dim() > 32) throw std::invalid_argument("result rank exceeds 32");
