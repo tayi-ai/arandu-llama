@@ -34,6 +34,30 @@ func TestSequenceLongerThanTheNativeChunkLimit(t *testing.T) {
 	compareReference(t, g, sequence.DefaultLimits().ChunkTokens, torch.Float64)
 }
 
+func TestSequence1128TokenFloat32ForwardMatchesReference(t *testing.T) {
+	g := training.RecurrentGeometry{Batch: 1, Tokens: 1128, Heads: 2, KeyDim: 4, ValueDim: 4}
+	input, _, _ := fixture(g, torch.Float32)
+	expected, err := training.GatedDeltaForward(context.Background(), g, input, training.DefaultRecurrentOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := nativeInput(t, g, input, torch.Float32, false)
+	limits := sequence.DefaultLimits()
+	output, err := sequence.Forward(context.Background(), native, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = output.Close() })
+	closeValues(t, "1128-token output", read(t, output.Values), expected.Values, 6e-5)
+	closeValues(t, "1128-token state", read(t, output.FinalState), expected.FinalState, 6e-5)
+	for _, value := range []*torch.Tensor{output.Values, output.FinalState} {
+		finite, err := value.AllFinite()
+		if err != nil || !finite {
+			t.Fatalf("1128-token forward is non-finite: finite=%t err=%v", finite, err)
+		}
+	}
+}
+
 func compareReference(t *testing.T, g training.RecurrentGeometry, chunk int64, dtype torch.DType) {
 	t.Helper()
 	input, dValues, dState := fixture(g, dtype)

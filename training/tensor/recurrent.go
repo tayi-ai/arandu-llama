@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/tayi-ai/arandu-llama/training/torch"
@@ -29,9 +30,11 @@ const (
 )
 
 // Limits bounds one chunk. Both values must be positive and may only lower the
-// absolute caps. WorkingElements admits 8*(T+2)*state_elements plus eight times
-// the input and output elements. This deliberately conservative element budget
-// does not replace measurement of native peak memory on a target device.
+// absolute caps. WorkingElements keeps the conservative pre-existing
+// 8*(T+2)*state_elements plus eight-times-input/output admission bound. The
+// chunk transform allocates different intermediates, but this bound remains at
+// least as strict for the admitted geometry; it does not replace target-device
+// peak-memory measurement.
 type Limits struct {
 	Tokens          int64
 	WorkingElements int64
@@ -151,42 +154,124 @@ func GradVJP(ctx context.Context, input Input, dValues, dFinalState *torch.Tenso
 }
 
 func forward(ctx context.Context, input Input, g geometry) (result *Output, err error) {
-	state := input.InitialState
-	ownedState := false
-	values := make([]*torch.Tensor, 0, g.tokens)
-	defer func() {
-		_ = closeTensors(values)
-		if result == nil && ownedState {
-			_ = state.Close()
-		}
-	}()
-	for token := int64(0); token < g.tokens; token++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		next, value, err := step(ctx, input, state, g, token)
-		if err != nil {
-			return nil, err
-		}
-		if ownedState {
-			_ = state.Close()
-		}
-		state, ownedState = next, true
-		values = append(values, value)
-	}
-	combined, err := torch.Cat(values, 1)
+	// Qwen3.5 uses the chunked Gated Delta rule for multi-token sequences. The
+	// token-by-token recurrence is mathematically equivalent but accumulates
+	// substantially more rounding error on long FP32 prompts. Reproduce the
+	// reference chunk transform here while keeping the existing Go-owned graph.
+	info, err := input.Query.Info()
 	if err != nil {
 		return nil, err
 	}
-	if err := finite(ctx, "output", combined); err != nil {
-		_ = combined.Close()
+	s := scope{ctx: ctx}
+	defer func() {
+		if result == nil {
+			s.closeExcept()
+		}
+	}()
+
+	q := s.call(func() (*torch.Tensor, error) { return input.Query.Transpose(1, 2) })
+	k := s.call(func() (*torch.Tensor, error) { return input.Key.Transpose(1, 2) })
+	v := s.call(func() (*torch.Tensor, error) { return input.Value.Transpose(1, 2) })
+	beta := s.call(func() (*torch.Tensor, error) { return input.Beta.Transpose(1, 2) })
+	decay := s.call(func() (*torch.Tensor, error) { return input.LogDecay.Transpose(1, 2) })
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	beta4 := s.call(func() (*torch.Tensor, error) { return beta.Unsqueeze(-1) })
+	vBeta := s.call(func() (*torch.Tensor, error) { return v.Mul(beta4) })
+	kBeta := s.call(func() (*torch.Tensor, error) { return k.Mul(beta4) })
+	cumulative := cumulativeDecay(&s, decay, g.tokens)
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	left := s.call(func() (*torch.Tensor, error) { return cumulative.Unsqueeze(-1) })
+	right := s.call(func() (*torch.Tensor, error) { return cumulative.Unsqueeze(-2) })
+	pairwise := s.call(func() (*torch.Tensor, error) { return left.Sub(right) })
+	maskBytes := make([]byte, g.tokens*g.tokens)
+	for row := int64(0); row < g.tokens; row++ {
+		for column := row + 1; column < g.tokens; column++ {
+			maskBytes[row*g.tokens+column] = 1
+		}
+	}
+	mask := s.call(func() (*torch.Tensor, error) {
+		return torch.FromBytes(maskBytes, []int64{g.tokens, g.tokens}, torch.Bool, info.Device, false)
+	})
+	pairwise = s.call(func() (*torch.Tensor, error) { return pairwise.MaskedFill(mask, math.Inf(-1)) })
+	pairwise = s.call(func() (*torch.Tensor, error) { return pairwise.Exp() })
+	kT := s.call(func() (*torch.Tensor, error) { return k.Transpose(-1, -2) })
+	ut := s.call(func() (*torch.Tensor, error) { return kBeta.MatMul(kT) })
+	ut = s.call(func() (*torch.Tensor, error) { return ut.Mul(pairwise) })
+	intra := s.call(func() (*torch.Tensor, error) { return q.MatMul(kT) })
+	intra = s.call(func() (*torch.Tensor, error) { return intra.Mul(pairwise) })
+
+	cumulativeExp := s.call(func() (*torch.Tensor, error) { return cumulative.Exp() })
+	cumulativeExp4 := s.call(func() (*torch.Tensor, error) { return cumulativeExp.Unsqueeze(-1) })
+	decayedKBeta := s.call(func() (*torch.Tensor, error) { return kBeta.Mul(cumulativeExp4) })
+	newValues := solveUnitLower(&s, ut, vBeta, g.tokens)
+	kCumulative := solveUnitLower(&s, ut, decayedKBeta, g.tokens)
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	query := s.call(func() (*torch.Tensor, error) { return q.Mul(cumulativeExp4) })
+	last := s.call(func() (*torch.Tensor, error) { return cumulative.Slice(2, g.tokens-1, g.tokens, 1) })
+	relative := s.call(func() (*torch.Tensor, error) { return last.Sub(cumulative) })
+	relative = s.call(func() (*torch.Tensor, error) { return relative.Exp() })
+	relative4 := s.call(func() (*torch.Tensor, error) { return relative.Unsqueeze(-1) })
+	key := s.call(func() (*torch.Tensor, error) { return k.Mul(relative4) })
+
+	predicted := s.call(func() (*torch.Tensor, error) { return kCumulative.MatMul(input.InitialState) })
+	vNew := s.call(func() (*torch.Tensor, error) { return newValues.Sub(predicted) })
+	inter := s.call(func() (*torch.Tensor, error) { return query.MatMul(input.InitialState) })
+	within := s.call(func() (*torch.Tensor, error) { return intra.MatMul(vNew) })
+	values := s.call(func() (*torch.Tensor, error) { return inter.Add(within) })
+	values = s.call(func() (*torch.Tensor, error) { return values.Transpose(1, 2) })
+
+	chunkDecay := s.call(func() (*torch.Tensor, error) { return last.Exp() })
+	chunkDecay = s.call(func() (*torch.Tensor, error) { return chunkDecay.Unsqueeze(-1) })
+	decayedState := s.call(func() (*torch.Tensor, error) { return input.InitialState.Mul(chunkDecay) })
+	keyFinalT := s.call(func() (*torch.Tensor, error) { return key.Transpose(-1, -2) })
+	update := s.call(func() (*torch.Tensor, error) { return keyFinalT.MatMul(vNew) })
+	state := s.call(func() (*torch.Tensor, error) { return decayedState.Add(update) })
+	if s.err != nil {
+		return nil, s.err
+	}
+	if err := finite(ctx, "output", values); err != nil {
 		return nil, err
 	}
 	if err := finite(ctx, "final state", state); err != nil {
-		_ = combined.Close()
 		return nil, err
 	}
-	return &Output{Values: combined, FinalState: state}, nil
+	s.closeExcept(values, state)
+	return &Output{Values: values, FinalState: state}, nil
+}
+
+func cumulativeDecay(s *scope, decay *torch.Tensor, tokens int64) *torch.Tensor {
+	rows := make([]*torch.Tensor, 0, int(tokens))
+	for token := int64(0); token < tokens; token++ {
+		prefix := s.call(func() (*torch.Tensor, error) { return decay.Slice(2, 0, token+1, 1) })
+		row := s.call(func() (*torch.Tensor, error) { return prefix.Sum([]int64{2}, false) })
+		rows = append(rows, row)
+	}
+	return s.call(func() (*torch.Tensor, error) { return torch.Stack(rows, 2) })
+}
+
+func solveUnitLower(s *scope, lower, rhs *torch.Tensor, tokens int64) *torch.Tensor {
+	rows := make([]*torch.Tensor, 0, int(tokens))
+	for token := int64(0); token < tokens; token++ {
+		row := s.call(func() (*torch.Tensor, error) { return rhs.Slice(2, token, token+1, 1) })
+		if token > 0 {
+			coefficients := s.call(func() (*torch.Tensor, error) { return lower.Slice(2, token, token+1, 1) })
+			coefficients = s.call(func() (*torch.Tensor, error) { return coefficients.Slice(3, 0, token, 1) })
+			previous := s.call(func() (*torch.Tensor, error) { return torch.Cat(rows, 2) })
+			correction := s.call(func() (*torch.Tensor, error) { return coefficients.MatMul(previous) })
+			row = s.call(func() (*torch.Tensor, error) { return row.Sub(correction) })
+		}
+		rows = append(rows, row)
+	}
+	return s.call(func() (*torch.Tensor, error) { return torch.Cat(rows, 2) })
 }
 
 // scope releases every intermediate handle; native autograd separately retains
@@ -213,43 +298,12 @@ func (s *scope) call(operation func() (*torch.Tensor, error)) *torch.Tensor {
 	return tensor
 }
 
-func (s *scope) token(tensor *torch.Tensor, token int64, shape []int64) *torch.Tensor {
-	view := s.call(func() (*torch.Tensor, error) { return tensor.Slice(1, token, token+1, 1) })
-	return s.call(func() (*torch.Tensor, error) { return view.Reshape(shape) })
-}
-
 func (s *scope) closeExcept(keep ...*torch.Tensor) {
 	for _, tensor := range s.owned {
 		if !slices.Contains(keep, tensor) {
 			_ = tensor.Close()
 		}
 	}
-}
-
-func step(ctx context.Context, input Input, state *torch.Tensor, g geometry, token int64) (next, value *torch.Tensor, err error) {
-	s := scope{ctx: ctx}
-	defer func() { s.closeExcept(next, value) }()
-	q := s.token(input.Query, token, []int64{g.batch, g.heads, g.key, 1})
-	k := s.token(input.Key, token, []int64{g.batch, g.heads, g.key, 1})
-	v := s.token(input.Value, token, []int64{g.batch, g.heads, g.value, 1})
-	logDecay := s.token(input.LogDecay, token, []int64{g.batch, g.heads, 1, 1})
-	beta := s.token(input.Beta, token, []int64{g.batch, g.heads, 1, 1})
-	decay := s.call(func() (*torch.Tensor, error) { return logDecay.Exp() })
-	p := s.call(func() (*torch.Tensor, error) { return state.Mul(decay) })
-	pTranspose := s.call(func() (*torch.Tensor, error) { return p.Transpose(-2, -1) })
-	prediction := s.call(func() (*torch.Tensor, error) { return pTranspose.MatMul(k) })
-	e := s.call(func() (*torch.Tensor, error) { return v.Sub(prediction) })
-	u := s.call(func() (*torch.Tensor, error) { return beta.Mul(e) })
-	uTranspose := s.call(func() (*torch.Tensor, error) { return u.Transpose(-2, -1) })
-	update := s.call(func() (*torch.Tensor, error) { return k.MatMul(uTranspose) })
-	newState := s.call(func() (*torch.Tensor, error) { return p.Add(update) })
-	stateTranspose := s.call(func() (*torch.Tensor, error) { return newState.Transpose(-2, -1) })
-	column := s.call(func() (*torch.Tensor, error) { return stateTranspose.MatMul(q) })
-	output := s.call(func() (*torch.Tensor, error) { return column.Reshape([]int64{g.batch, 1, g.heads, g.value}) })
-	if s.err != nil {
-		return nil, nil, s.err
-	}
-	return newState, output, nil
 }
 
 var inputNames = []string{"query", "key", "value", "log decay", "beta", "initial state"}
