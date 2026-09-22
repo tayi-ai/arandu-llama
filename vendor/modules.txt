@@ -1,0 +1,178 @@
+# github.com/Masterminds/semver/v3 v3.4.0
+## explicit; go 1.21
+github.com/Masterminds/semver/v3
+# github.com/arandu-io/framework v0.46.4
+## explicit; go 1.26
+github.com/arandu-io/framework/data
+github.com/arandu-io/framework/foundation
+github.com/arandu-io/framework/foundation/bootstrap
+github.com/arandu-io/framework/http
+github.com/arandu-io/framework/http/middleware
+github.com/arandu-io/framework/internal/routes
+github.com/arandu-io/framework/observability
+github.com/arandu-io/framework/observability/errorpage
+github.com/arandu-io/framework/security
+github.com/arandu-io/framework/validation
+# github.com/arandu-io/hesape v0.37.0
+## explicit; go 1.26
+github.com/arandu-io/hesape/auth
+github.com/arandu-io/hesape/bus
+github.com/arandu-io/hesape/bus/events
+github.com/arandu-io/hesape/cache
+github.com/arandu-io/hesape/cache/events
+github.com/arandu-io/hesape/collections
+github.com/arandu-io/hesape/collections/arr
+github.com/arandu-io/hesape/config
+github.com/arandu-io/hesape/database
+github.com/arandu-io/hesape/database/concerns
+github.com/arandu-io/hesape/database/events
+github.com/arandu-io/hesape/database/migrations
+github.com/arandu-io/hesape/database/model
+github.com/arandu-io/hesape/database/model/relations
+github.com/arandu-io/hesape/database/model/relations/concerns
+github.com/arandu-io/hesape/database/query
+github.com/arandu-io/hesape/database/query/grammars
+github.com/arandu-io/hesape/database/query/processors
+github.com/arandu-io/hesape/database/schema
+github.com/arandu-io/hesape/database/schema/grammars
+github.com/arandu-io/hesape/encryption
+github.com/arandu-io/hesape/enum
+github.com/arandu-io/hesape/events
+github.com/arandu-io/hesape/exception
+github.com/arandu-io/hesape/filesystem
+github.com/arandu-io/hesape/foundation
+github.com/arandu-io/hesape/hashing
+github.com/arandu-io/hesape/http
+github.com/arandu-io/hesape/http/exceptions
+github.com/arandu-io/hesape/http/middleware
+github.com/arandu-io/hesape/image
+github.com/arandu-io/hesape/image/transformations
+github.com/arandu-io/hesape/internal/filetype
+github.com/arandu-io/hesape/log
+github.com/arandu-io/hesape/log/context
+github.com/arandu-io/hesape/log/context/events
+github.com/arandu-io/hesape/log/events
+github.com/arandu-io/hesape/number
+github.com/arandu-io/hesape/pagination
+github.com/arandu-io/hesape/pipeline
+github.com/arandu-io/hesape/process
+github.com/arandu-io/hesape/queue
+github.com/arandu-io/hesape/queue/attributes
+github.com/arandu-io/hesape/queue/events
+github.com/arandu-io/hesape/queue/failed
+github.com/arandu-io/hesape/queue/jobs
+github.com/arandu-io/hesape/queue/middleware
+github.com/arandu-io/hesape/routing
+github.com/arandu-io/hesape/routing/exceptions
+github.com/arandu-io/hesape/routing/matching
+github.com/arandu-io/hesape/routing/middleware
+github.com/arandu-io/hesape/session
+github.com/arandu-io/hesape/str
+github.com/arandu-io/hesape/support
+github.com/arandu-io/hesape/support/deferpkg
+github.com/arandu-io/hesape/toon
+github.com/arandu-io/hesape/translation
+github.com/arandu-io/hesape/validation
+github.com/arandu-io/hesape/view
+github.com/arandu-io/hesape/view/engines
+# github.com/go-logr/logr v1.4.3
+## explicit; go 1.18
+github.com/go-logr/logr
+github.com/go-logr/logr/funcr
+# github.com/go-task/slim-sprig/v3 v3.0.0
+## explicit; go 1.20
+github.com/go-task/slim-sprig/v3
+# github.com/google/go-cmp v0.7.0
+## explicit; go 1.21
+github.com/google/go-cmp/cmp
+github.com/google/go-cmp/cmp/internal/diff
+github.com/google/go-cmp/cmp/internal/flags
+github.com/google/go-cmp/cmp/internal/function
+github.com/google/go-cmp/cmp/internal/value
+# github.com/google/pprof v0.0.0-20250923004556-9e5a51aed1e8
+## explicit; go 1.24.0
+github.com/google/pprof/profile
+# github.com/onsi/ginkgo/v2 v2.25.3
+## explicit; go 1.23.0
+github.com/onsi/ginkgo/v2
+github.com/onsi/ginkgo/v2/config
+github.com/onsi/ginkgo/v2/formatter
+github.com/onsi/ginkgo/v2/ginkgo
+github.com/onsi/ginkgo/v2/ginkgo/build
+github.com/onsi/ginkgo/v2/ginkgo/command
+github.com/onsi/ginkgo/v2/ginkgo/generators
+github.com/onsi/ginkgo/v2/ginkgo/internal
+github.com/onsi/ginkgo/v2/ginkgo/labels
+github.com/onsi/ginkgo/v2/ginkgo/outline
+github.com/onsi/ginkgo/v2/ginkgo/run
+github.com/onsi/ginkgo/v2/ginkgo/unfocus
+github.com/onsi/ginkgo/v2/ginkgo/watch
+github.com/onsi/ginkgo/v2/internal
+github.com/onsi/ginkgo/v2/internal/global
+github.com/onsi/ginkgo/v2/internal/interrupt_handler
+github.com/onsi/ginkgo/v2/internal/parallel_support
+github.com/onsi/ginkgo/v2/internal/testingtproxy
+github.com/onsi/ginkgo/v2/reporters
+github.com/onsi/ginkgo/v2/types
+# github.com/onsi/gomega v1.38.2
+## explicit; go 1.23.0
+github.com/onsi/gomega
+github.com/onsi/gomega/format
+github.com/onsi/gomega/internal
+github.com/onsi/gomega/internal/gutil
+github.com/onsi/gomega/matchers
+github.com/onsi/gomega/matchers/internal/miter
+github.com/onsi/gomega/matchers/support/goraph/bipartitegraph
+github.com/onsi/gomega/matchers/support/goraph/edge
+github.com/onsi/gomega/matchers/support/goraph/node
+github.com/onsi/gomega/matchers/support/goraph/util
+github.com/onsi/gomega/types
+# go.uber.org/automaxprocs v1.6.0
+## explicit; go 1.20
+go.uber.org/automaxprocs
+go.uber.org/automaxprocs/internal/cgroups
+go.uber.org/automaxprocs/internal/runtime
+go.uber.org/automaxprocs/maxprocs
+# go.yaml.in/yaml/v3 v3.0.4
+## explicit; go 1.16
+go.yaml.in/yaml/v3
+# golang.org/x/crypto v0.55.0
+## explicit; go 1.25.0
+golang.org/x/crypto/argon2
+golang.org/x/crypto/bcrypt
+golang.org/x/crypto/blake2b
+golang.org/x/crypto/blowfish
+# golang.org/x/net v0.57.0
+## explicit; go 1.25.0
+golang.org/x/net/html
+golang.org/x/net/html/atom
+golang.org/x/net/html/charset
+# golang.org/x/sys v0.47.0
+## explicit; go 1.25.0
+golang.org/x/sys/cpu
+golang.org/x/sys/unix
+# golang.org/x/text v0.41.0
+## explicit; go 1.25.0
+golang.org/x/text/encoding
+golang.org/x/text/encoding/charmap
+golang.org/x/text/encoding/htmlindex
+golang.org/x/text/encoding/internal
+golang.org/x/text/encoding/internal/identifier
+golang.org/x/text/encoding/japanese
+golang.org/x/text/encoding/korean
+golang.org/x/text/encoding/simplifiedchinese
+golang.org/x/text/encoding/traditionalchinese
+golang.org/x/text/encoding/unicode
+golang.org/x/text/internal/language
+golang.org/x/text/internal/language/compact
+golang.org/x/text/internal/tag
+golang.org/x/text/internal/utf8internal
+golang.org/x/text/language
+golang.org/x/text/runes
+golang.org/x/text/transform
+golang.org/x/text/unicode/norm
+# golang.org/x/tools v0.48.0
+## explicit; go 1.25.0
+golang.org/x/tools/cover
+golang.org/x/tools/go/ast/edge
+golang.org/x/tools/go/ast/inspector

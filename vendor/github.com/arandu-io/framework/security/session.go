@@ -1,0 +1,406 @@
+// Sessions, answered by github.com/arandu-io/hesape/session, and -- for the
+// address a guard remembers before sending somebody to the sign-in screen --
+// by github.com/arandu-io/hesape/http.
+//
+// This is where the design diverged most, so this is where the envelopes are.
+// The constants, the errors and the option type alias; SessionBackend,
+// MemoryBackend and SessionStore translate.
+
+package security
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	hhttp "github.com/arandu-io/hesape/http"
+	"github.com/arandu-io/hesape/session"
+)
+
+// SessionCookieName is the cookie the framework reads and writes. It is fixed
+// on purpose: a configurable cookie name buys nothing and breaks the CSRF
+// binding when two parts of a project disagree about it.
+//
+// It is session.CookieName under a name that repeats the package: one constant
+// with two spellings, so a cookie written through either is read by the other.
+const SessionCookieName = session.CookieName
+
+// Errors returned by SessionStore.
+var (
+	// ErrNoSession means the request carries no session cookie, or the cookie
+	// signature does not match the application key.
+	ErrNoSession = session.ErrNoSession
+
+	// ErrSessionExpired means the session id is well formed but the backend no
+	// longer holds it -- expired, or destroyed by a logout elsewhere.
+	//
+	// It is session.ErrExpired, and being the same value rather than an equal
+	// one is what keeps a backend correct without a line changing: the backend
+	// returns this name, hesape/session.Handler requires that one, and there is
+	// only ever one value to match.
+	ErrSessionExpired = session.ErrExpired
+
+	// ErrConfirmationNotStored means the backend accepted the password
+	// confirmation stamp and did not keep it, so no window would ever be
+	// satisfied and the password screen would ask again immediately.
+	ErrConfirmationNotStored = session.ErrConfirmationNotStored
+)
+
+// RememberLifetime is how long a session started with Remember(true) lives.
+const RememberLifetime = session.RememberLifetime
+
+// PasswordConfirmationWindow is how long typing the password again counts for.
+const PasswordConfirmationWindow = session.PasswordConfirmationWindow
+
+// SessionOption adjusts how a session is started.
+type SessionOption = session.Option
+
+// Remember asks for a session that survives closing the browser, for
+// RememberLifetime instead of the store's ttl.
+func Remember(on bool) SessionOption { return session.Remember(on) }
+
+// PasswordConfirmedWithin reports whether the password was typed again on this
+// session less than window ago.
+//
+// It was a method on Subject and it cannot be one here: Subject is an alias for
+// hesape/auth.Subject, and Go does not let a package declare a method on a type
+// another package owns. In hesape the question is asked of the session record
+// -- session.Record.PasswordConfirmedWithin -- because that is where the stamp
+// lives once the payload is opaque to the store.
+//
+// So this is a function, and it is the one place in this bridge where a caller
+// has to be rewritten rather than recompiled:
+//
+//	sub.PasswordConfirmedWithin(w)  becomes  security.PasswordConfirmedWithin(sub, w)
+//
+// It builds the record hesape asks and asks it, so the three refusals -- no
+// stamp, a stamp in the future, a window of zero -- are decided by the code
+// that runs in production and not by a second copy of them here.
+func PasswordConfirmedWithin(sub Subject, window time.Duration) bool {
+	return recordFor(sub).PasswordConfirmedWithin(window)
+}
+
+// SessionBackend stores the subject behind a session id.
+//
+// It stays declared here, with the old four method names, rather than aliasing
+// hesape/session.Handler -- which renamed all four: Get is Read, Put is Write,
+// Delete is Destroy and DeleteSubject is DestroyIndex.
+//
+// A backend implements this interface, by these names, from a module this one
+// does not compile: an alias here would compile in the framework and break it
+// in silence, which is the one failure this bridge exists to prevent.
+// backendHandler is what carries an implementation of this across to hesape.
+type SessionBackend interface {
+	// Get returns the subject, or ErrSessionExpired when the backend does not
+	// hold the id -- expired, evicted, or destroyed by a logout elsewhere.
+	Get(ctx context.Context, id string) (Subject, error)
+
+	// Put stores the subject under id for the given ttl. It must store every
+	// exported field of the Subject it is given: a field it silently drops
+	// reads back as the zero value, and only in the deployment that uses that
+	// backend.
+	Put(ctx context.Context, id string, s Subject, ttl time.Duration) error
+
+	// Delete removes the session, if present.
+	Delete(ctx context.Context, id string) error
+
+	// DeleteSubject removes every session belonging to one subject of one
+	// tenant, except keepID. An empty keepID keeps none of them.
+	//
+	// The tenant is part of the question, not a filter applied afterwards.
+	// An empty tenant or an empty subject id is an error.
+	DeleteSubject(ctx context.Context, tenant, subjectID, keepID string) error
+}
+
+// recordFor is half the translation SessionStore exists to do: hesape/session
+// keeps the index -- the tenant, the account and the two fields that decide how
+// long the record lives -- beside an opaque payload, where this package kept
+// all of it on the Subject.
+func recordFor(sub Subject) session.Record[Subject] {
+	return session.Record[Subject]{
+		Payload:             sub,
+		Tenant:              sub.Tenant,
+		SubjectID:           sub.ID,
+		Remembered:          sub.Remembered,
+		PasswordConfirmedAt: sub.PasswordConfirmedAt,
+	}
+}
+
+// subjectFrom is the other half. The two fields the store owns are folded back
+// onto the payload, because that is where a caller of Load has always read them
+// and where a backend written against SessionBackend has always stored them.
+func subjectFrom(rec session.Record[Subject]) Subject {
+	sub := rec.Payload
+	sub.Remembered = rec.Remembered
+	sub.PasswordConfirmedAt = rec.PasswordConfirmedAt
+	return sub
+}
+
+// backendHandler presents a SessionBackend as a hesape/session.Handler.
+//
+// It translates four method names and the record while preserving the
+// SessionBackend contract implemented by the caller.
+type backendHandler struct{ backend SessionBackend }
+
+var _ session.Handler[Subject] = backendHandler{}
+
+func (h backendHandler) Read(ctx context.Context, id string) (session.Record[Subject], error) {
+	sub, err := h.backend.Get(ctx, id)
+	if err != nil {
+		return session.Record[Subject]{}, err
+	}
+	return recordFor(sub), nil
+}
+
+func (h backendHandler) Write(ctx context.Context, id string, rec session.Record[Subject], ttl time.Duration) error {
+	return h.backend.Put(ctx, id, subjectFrom(rec), ttl)
+}
+
+func (h backendHandler) Destroy(ctx context.Context, id string) error {
+	return h.backend.Delete(ctx, id)
+}
+
+func (h backendHandler) DestroyIndex(ctx context.Context, tenant, subjectID, keepID string) error {
+	return h.backend.DeleteSubject(ctx, tenant, subjectID, keepID)
+}
+
+// NewSessionBackend presents a session handler as a SessionBackend.
+//
+// It is backendHandler run the other way, and it exists because the traffic is
+// not one-way. A backend written against the four names of this package needs
+// carrying across; a handler written against the four names of hesape/session
+// needs carrying back, and a distributed one is written there -- it is the
+// same interface for every store that keeps sessions off the process, and none
+// of them knows this package exists.
+//
+//	handler := <driver>.NewCacheBasedSessionHandler[security.Subject](conn)
+//	store := security.NewSessionStore(key, ttl, true, security.NewSessionBackend(handler))
+//
+// The payload type is Subject and is not a choice the caller makes: a session
+// of this framework holds a Subject, so a handler over anything else is a
+// handler for a different store.
+//
+// The four renames are all there is, and each is the same operation under
+// another name: Read is Get, Write is Put, Destroy is Delete, DestroyIndex is
+// DeleteSubject. The record translation is the same one MemoryBackend does --
+// hesape/session keeps the tenant, the account and the two fields that decide
+// how long a record lives beside an opaque payload, and this package keeps all
+// of it on the Subject.
+//
+// The refusal crosses unchanged, which is the half a careless adapter loses: a
+// handler that does not hold the id answers session.ErrExpired, and
+// ErrSessionExpired is that same value, so a caller branching on it to send
+// somebody back to the sign-in screen behaves the same whichever store is
+// wired.
+//
+// A nil handler is a wiring mistake rather than a request for the in-memory
+// store, and it panics on the first session. Substituting memory here would
+// answer it by quietly giving a fleet of replicas a session store per process,
+// which is the failure the distributed handler was wired to prevent.
+func NewSessionBackend(h session.Handler[Subject]) SessionBackend {
+	return handlerBackend{handler: h}
+}
+
+// handlerBackend presents a hesape/session.Handler as a SessionBackend.
+//
+// A value rather than a pointer: it holds one field it never writes, and every
+// method forwards. Two goroutines calling it share nothing but the handler,
+// which is where the concurrency question belongs.
+type handlerBackend struct{ handler session.Handler[Subject] }
+
+var _ SessionBackend = handlerBackend{}
+
+// Get returns the subject, or ErrSessionExpired when the handler does not hold
+// the id.
+func (b handlerBackend) Get(ctx context.Context, id string) (Subject, error) {
+	rec, err := b.handler.Read(ctx, id)
+	if err != nil {
+		return Subject{}, err
+	}
+	return subjectFrom(rec), nil
+}
+
+// Put stores the subject under id for the given ttl.
+func (b handlerBackend) Put(ctx context.Context, id string, s Subject, ttl time.Duration) error {
+	return b.handler.Write(ctx, id, recordFor(s), ttl)
+}
+
+// Delete removes the session, if present.
+func (b handlerBackend) Delete(ctx context.Context, id string) error {
+	return b.handler.Destroy(ctx, id)
+}
+
+// DeleteSubject removes every session of one subject of one tenant except
+// keepID.
+func (b handlerBackend) DeleteSubject(ctx context.Context, tenant, subjectID, keepID string) error {
+	return b.handler.DestroyIndex(ctx, tenant, subjectID, keepID)
+}
+
+// MemoryBackend keeps sessions in the process memory.
+//
+// It is the right choice for development and for a single instance. Behind more
+// than one pod it silently logs people out on every deploy and on every request
+// routed elsewhere -- use a Redis-backed handler through NewSessionBackend.
+//
+// It is the same four renames as backendHandler, run the other way: the store
+// underneath is hesape/session.ArrayHandler, and nothing is kept here. Those
+// renames are why it is a declaration and not an alias -- Get, Put, Delete and
+// DeleteSubject are Read, Write, Destroy and DestroyIndex there, and a backend
+// outside this module implements the four names below.
+type MemoryBackend struct {
+	handler *session.ArrayHandler[Subject]
+}
+
+var _ SessionBackend = (*MemoryBackend)(nil)
+
+// NewMemoryBackend returns an empty in-memory session backend.
+func NewMemoryBackend() *MemoryBackend {
+	return &MemoryBackend{handler: session.NewArrayHandler[Subject]()}
+}
+
+// Get returns the subject, or ErrSessionExpired when the id is unknown.
+func (m *MemoryBackend) Get(ctx context.Context, id string) (Subject, error) {
+	rec, err := m.handler.Read(ctx, id)
+	if err != nil {
+		return Subject{}, err
+	}
+	return subjectFrom(rec), nil
+}
+
+// Put stores the subject under id for the given ttl.
+func (m *MemoryBackend) Put(ctx context.Context, id string, s Subject, ttl time.Duration) error {
+	return m.handler.Write(ctx, id, recordFor(s), ttl)
+}
+
+// Delete removes the session, if present.
+func (m *MemoryBackend) Delete(ctx context.Context, id string) error {
+	return m.handler.Destroy(ctx, id)
+}
+
+// DeleteSubject removes every session of one subject of one tenant except
+// keepID. An empty tenant or an empty subject id is refused.
+func (m *MemoryBackend) DeleteSubject(ctx context.Context, tenant, subjectID, keepID string) error {
+	return m.handler.DestroyIndex(ctx, tenant, subjectID, keepID)
+}
+
+// SessionStore issues and validates sessions.
+//
+// It is an envelope over hesape/session.RecordStore[Subject] and
+// hesape/http.Intended rather than an alias of either, because the two shapes
+// diverge in three ways at once: four methods answer to different names there,
+// Load returns the Subject where RecordStore.All returns the Record that wraps
+// one, and the intended destination belongs to neither -- it is an address, and
+// hesape/session never validates a URL.
+//
+// The cookie is the same cookie. hesape/session signs the same name with the
+// same key, so a browser holding a session issued through either is signed in
+// for both.
+type SessionStore struct {
+	store    *session.RecordStore[Subject]
+	intended *hhttp.Intended
+}
+
+// NewSessionStore returns a store. Pass secure=false only in development:
+// without the Secure attribute the cookie travels over plain HTTP.
+func NewSessionStore(appKey []byte, ttl time.Duration, secure bool, b SessionBackend) *SessionStore {
+	if b == nil {
+		b = NewMemoryBackend()
+	}
+	return &SessionStore{
+		store:    session.NewRecordStore[Subject](appKey, ttl, secure, backendHandler{backend: b}),
+		intended: hhttp.NewIntended(appKey, secure),
+	}
+}
+
+// Start creates a session for the subject and writes the cookie.
+func (s *SessionStore) Start(ctx context.Context, w http.ResponseWriter, sub Subject, opts ...SessionOption) (string, error) {
+	return s.store.Start(ctx, w, recordFor(sub), opts...)
+}
+
+// Rotate issues a new session id for the same subject and destroys the old one.
+//
+// It MUST be called on login: keeping the pre-login id is session fixation.
+//
+// It is session.RecordStore.Regenerate -- one operation under two names, one
+// layer apart -- and oldID is the whole of what separates it from Start. Start
+// takes no id to replace, so a login written with it cannot destroy the record
+// the visitor arrived holding: the destruction is not skipped there, it is
+// unsayable. Regenerate with an empty oldID is byte for byte what Start does,
+// so a sign-in on a request that carries no session is written with this name
+// too.
+func (s *SessionStore) Rotate(ctx context.Context, w http.ResponseWriter, oldID string, sub Subject, opts ...SessionOption) (string, error) {
+	return s.store.Regenerate(ctx, w, oldID, recordFor(sub), opts...)
+}
+
+// Load returns the subject bound to the request's session cookie.
+//
+// It is session.RecordStore.All with the wrapper taken off: that one answers a
+// Record carrying the tenant, the account and the two fields that decide the
+// lifetime, and this returns the Subject inside it.
+func (s *SessionStore) Load(ctx context.Context, r *http.Request) (Subject, error) {
+	rec, err := s.store.All(ctx, r)
+	if err != nil {
+		return Subject{}, err
+	}
+	return subjectFrom(rec), nil
+}
+
+// Confirm records on the request's session that the subject has just typed
+// their password again.
+//
+// It returns ErrConfirmationNotStored when the backend accepted the stamp and
+// did not keep it. A handler must report that rather than redirect: redirecting
+// sends the person back to the screen they just got right.
+func (s *SessionStore) Confirm(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	return s.store.Confirm(ctx, w, r)
+}
+
+// DestroyOthers signs the subject out of every session except keepID.
+//
+// The tenant comes from the subject, which came from the Grant or the session,
+// never from the request. A subject with no tenant is refused.
+func (s *SessionStore) DestroyOthers(ctx context.Context, sub Subject, keepID string) error {
+	return s.store.DestroyOthers(ctx, recordFor(sub), keepID)
+}
+
+// Destroy removes the session and clears the cookies this store put in the
+// browser -- the session, and the intended destination.
+//
+// The second one is not tidiness. Signing out is the moment a shared machine
+// changes hands, and the intended address outlives it by up to
+// IntendedLifetime: whoever signs in next is carried to the page the previous
+// person was refused.
+//
+// The two halves are two calls, because the address is not the session's to
+// hold: session.RecordStore.Invalidate ends the session and hhttp.Intended.Clear
+// drops the address. Keeping them together here is what stops the second one
+// from being forgotten at each call site.
+func (s *SessionStore) Destroy(ctx context.Context, w http.ResponseWriter, id string) error {
+	if err := s.store.Invalidate(ctx, w, id); err != nil {
+		return err
+	}
+	s.intended.Clear(w)
+	return nil
+}
+
+// IDFromRequest returns the session id when the cookie signature is valid, and
+// the empty string otherwise. It is the function to hand to the CSRF
+// middleware, which binds its token to this id.
+func (s *SessionStore) IDFromRequest(r *http.Request) string { return s.store.ID(r) }
+
+// RememberIntended records where this request was going, so that the sign-in
+// screen it is about to be sent to can finish the journey.
+//
+// It is hhttp.Intended.Remember, which is otherwise wired once at boot rather
+// than hanging off a session store. This store builds one over the same
+// application key, so an address written through either is read by the other.
+func (s *SessionStore) RememberIntended(w http.ResponseWriter, r *http.Request) {
+	s.intended.Remember(w, r)
+}
+
+// TakeIntended returns the address RememberIntended stored, and clears it.
+//
+// It is hhttp.Intended.Take, over the same Intended RememberIntended writes to.
+func (s *SessionStore) TakeIntended(w http.ResponseWriter, r *http.Request, fallback string) string {
+	return s.intended.Take(w, r, fallback)
+}

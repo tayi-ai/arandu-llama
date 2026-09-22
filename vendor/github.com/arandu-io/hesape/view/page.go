@@ -1,0 +1,368 @@
+package view
+
+import (
+	"net/url"
+	"strings"
+
+	hhttp "github.com/arandu-io/hesape/http"
+	"github.com/arandu-io/hesape/str"
+	"github.com/arandu-io/hesape/validation"
+)
+
+// Layout is what a layout asks of the data every screen hands it.
+//
+// It lives here rather than in the application because every Arandu application
+// declared the same ninety lines of it, and ninety lines nobody wrote are ninety
+// lines nobody reads. A project that needs different chrome declares its own
+// interface in the layout's @go block; this is the one the delivered layout uses.
+//
+// It is an interface rather than a struct so that pages with unrelated data
+// share one frame: the layout asks for behaviour, and Page below is the
+// implementation a page embeds to get it.
+type Layout interface {
+	// PageTitle is the document title, and what HTMX swaps on navigation.
+	PageTitle() string
+	// PageDescription is the meta description. Empty writes no tag, because a
+	// missing description outranks an empty one.
+	PageDescription() string
+	// CanonicalURL is the absolute address of this page, or empty for none.
+	CanonicalURL() string
+	// IsCurrent says whether a navigation target is this page, so the header
+	// can stop linking to where you already are.
+	IsCurrent(href string) bool
+
+	// BrandName is the application name in the navigation bar.
+	BrandName() string
+	// CSRFToken is what @csrf reads, and what <body> carries into every HTMX
+	// request.
+	CSRFToken() string
+
+	// SignedIn decides which half of the navigation is drawn, and SignedInName
+	// is who it greets.
+	SignedIn() bool
+	SignedInName() string
+
+	// The navigation targets. An empty one draws no link, which is how a route
+	// the application never registered stays out of the markup instead of
+	// becoming a 404 the layout put there.
+	HomeLink() string
+	LoginLink() string
+	LogoutLink() string
+	RegisterLink() string
+
+	// PanelLink is the signed-in person's own area, and AdminLink is the one
+	// only some of them may open. Both follow the same rule as the four above:
+	// empty draws nothing.
+	//
+	// AdminLink is empty for anybody who would be refused, which is what keeps
+	// the header from ever offering an address that answers 403. The decision is
+	// the controller's -- it holds the subject and the policy -- and the markup
+	// only ever sees a string. A layout that asked about roles would be a second
+	// place where authorization is decided, and the second place is the one that
+	// gets it wrong.
+	PanelLink() string
+	AdminLink() string
+
+	// Any says whether the attempt that landed here was rejected, and
+	// All is one line per failed field for the banner that says so.
+	//
+	// The banner is the layout's, which is why these two are here and the
+	// per-field message is not: a page body draws "must be at least 12
+	// characters" under the box it belongs to, and the layout draws the summary
+	// once, above everything. First and OldValue are promoted methods on
+	// Page for the body to call, deliberately outside this interface -- Layout
+	// is what the LAYOUT asks for.
+	Any() bool
+	All() []string
+}
+
+// Page is the chrome every screen hands the layout, embedded rather than
+// repeated:
+//
+//	type PostsIndexData struct {
+//		view.Page
+//		Posts []PostRow
+//	}
+//
+// A page declares a struct of its own -- which is what turns a typo in a field
+// name into a compile error -- and takes the frame from here.
+//
+// Nothing on it is a helper a view reaches for by itself. There is no config(),
+// no route() and no auth(): the controller fills these in, so a name that drifts
+// is a compile error rather than a blank link, and a form can never end up
+// carrying another session's token under load.
+type Page struct {
+	// Title is the document title.
+	Title string
+	// Description is the meta description, and the og:description. Leave it
+	// empty on a page that has nothing specific to say.
+	Description string
+	// Canonical is the absolute URL of this page. It is what stops the same post
+	// counting twice when it answers on more than one address.
+	Canonical string
+
+	// AppName is the brand in the navigation bar.
+	AppName string
+
+	// Token is the CSRF token issued for this session. It reaches the markup
+	// twice: as the hidden field @csrf writes, and as the hx-headers attribute
+	// on <body> that makes every HTMX request carry it.
+	Token string
+
+	// Authenticated decides which half of the navigation bar is drawn, and
+	// UserName is the signed-in person's display name.
+	Authenticated bool
+	UserName      string
+
+	// Where the navigation points. They come from the router, through the
+	// controller. RegisterURL is empty when registration is not open.
+	HomeURL     string
+	LoginURL    string
+	LogoutURL   string
+	RegisterURL string
+
+	// PanelURL and AdminURL are drawn only when signed in, and AdminURL only
+	// for somebody the policy would let in. Filled by the controller, from the
+	// subject it already holds -- see the Layout interface.
+	PanelURL string
+	AdminURL string
+
+	// Path is the address this page was served at, so the navigation can say
+	// where you are.
+	//
+	// A header that offers "Sign in" on the sign-in page is a header with a link
+	// to the page you are reading -- and the one control that would help, the
+	// way out to registering, is the one it does not show. The layout reads this
+	// through IsCurrent; nothing else needs it.
+	Path string
+
+	// Errors is what validation rejected on the attempt that was sent back
+	// here, keyed by the name of the form input -- the same name
+	// components.FieldProps.Name carries.
+	//
+	// It is filled by New, from the flash, and by nothing else. No handler
+	// assigns it: a handler that had to would be a handler that can forget to,
+	// and forgetting is invisible -- the form comes back with no messages on it,
+	// which is the failure this field exists to end.
+	//
+	// Empty on every page nobody was rejected on, which is nearly all of them.
+	Errors validation.Errors
+
+	// Old is what was typed on that attempt, so the boxes come back filled in
+	// rather than blank.
+	//
+	// It never carries a password. See session.Flash for the list and for why
+	// the MESSAGE for a password survives when the value does not: an empty
+	// password box that does not say why it was rejected is the original bug.
+	Old url.Values
+}
+
+// Compile-time proof that embedding Page is all a page has to do to fit the
+// layout. If the layout asks for something else, this line is where the build
+// stops -- in one file, naming the contract, rather than in every page at once.
+var _ Layout = Page{}
+
+// IsCurrent reports whether a navigation target is the page being read.
+//
+// It compares paths and ignores the query, because "?resent=1" is still the same
+// page -- a navigation that changes when a flash message is added is one nobody
+// can predict.
+//
+// An empty href is never current: an empty URL draws no control, and a control
+// that is not drawn cannot be the one you are on.
+func (p Page) IsCurrent(href string) bool {
+	if href == "" || p.Path == "" {
+		return false
+	}
+	if at := strings.IndexByte(href, '?'); at >= 0 {
+		href = href[:at]
+	}
+	return strings.TrimSuffix(p.Path, "/") == strings.TrimSuffix(href, "/")
+}
+
+// PageTitle is what the browser tab shows.
+func (p Page) PageTitle() string { return p.Title }
+
+// PageDescription is the meta description of this page.
+func (p Page) PageDescription() string { return p.Description }
+
+// CanonicalURL is the address search engines should treat as this page's own.
+func (p Page) CanonicalURL() string { return p.Canonical }
+
+// BrandName is the application name, shown in the navigation bar.
+func (p Page) BrandName() string { return p.AppName }
+
+// CSRFToken is what @csrf reads to write the hidden field.
+//
+// It is a method rather than the field itself because the field is also
+// interpolated into hx-headers, and one name cannot be both.
+func (p Page) CSRFToken() string { return p.Token }
+
+// SignedIn reports whether there is a session behind this render.
+func (p Page) SignedIn() bool { return p.Authenticated }
+
+// SignedInName is who the navigation bar greets.
+func (p Page) SignedInName() string { return p.UserName }
+
+// HomeLink is where the brand points.
+func (p Page) HomeLink() string { return p.HomeURL }
+
+// LoginLink is the sign-in screen.
+func (p Page) LoginLink() string { return p.LoginURL }
+
+// LogoutLink is what the sign-out form posts to.
+func (p Page) LogoutLink() string { return p.LogoutURL }
+
+// RegisterLink is the sign-up screen, or empty when registration is closed.
+func (p Page) RegisterLink() string { return p.RegisterURL }
+
+// PanelLink is the signed-in person's own area, or empty.
+func (p Page) PanelLink() string { return p.PanelURL }
+
+// AdminLink is the administration area, or empty for anybody who would be
+// refused it.
+func (p Page) AdminLink() string { return p.AdminURL }
+
+// New returns the page chrome for this request, with the messages and the typed
+// input of a rejected attempt already on it.
+//
+//	Page: view.New(ctx, "New post").WithToken(token),
+//
+// It replaces the view.Page{Title: ..., Token: ...} literal a controller used to
+// write, and the difference is the whole point of this file: nothing in that
+// line mentions errors, and the errors are on the page. There is no argument to
+// pass and therefore none to forget, which matters because forgetting produces a
+// form that comes back blank -- correct-looking, and wrong.
+//
+// It fills only what the request itself knows: the title it was given, the
+// address being served, and what the flash left behind. The application name,
+// the navigation and the signed-in person are the controller's, because they are
+// decisions -- see the Layout interface on why the layout is never allowed to go
+// and fetch them.
+func New(ctx *hhttp.Context, title string) Page {
+	state := ctx.State()
+	return Page{
+		Title:  title,
+		Path:   ctx.Request.URL.Path,
+		Errors: state.Errors,
+		Old:    state.Old,
+	}
+}
+
+// WithToken sets the CSRF token, which the controller issues.
+//
+// A method rather than a field in the literal, so that New reads as one
+// expression at the call site. It returns a copy: Page is a value everywhere
+// else, and a builder that mutated in place would be the one method on it that
+// does.
+func (p Page) WithToken(token string) Page {
+	p.Token = token
+	return p
+}
+
+// First returns the first message for name, or empty.
+//
+// One message and not all of them, because that is what a form draws: the box
+// has room for one line, and the first is the one that names what to change.
+// A screen does not usually call it. It hands the whole Page to the input and
+// the input asks:
+//
+//	{!! components.Field(components.FieldProps{
+//		Name: "email", Label: "Email", Type: "email", Page: .Page,
+//	}) !!}
+//
+// components.Page is the two-method interface Page satisfies -- First and
+// OldOr -- so the name is written once, in one place, instead of once per prop
+// beside it. This comment used to say the message went in as `Error: ...`, a
+// prop that does not exist, and nine published screens were written from it.
+//
+// Empty for a field that was accepted, and empty for every field on a page
+// nobody was rejected on -- so a screen asks unconditionally and draws nothing
+// when there is nothing. There is no @error directive and none is needed.
+func (p Page) First(name string) string { return p.Errors.First(name) }
+
+// Get returns every message for name, for the rare screen that lists them.
+func (p Page) Get(name string) []string { return p.Errors.Get(name) }
+
+// Any reports whether the attempt that landed here was rejected.
+//
+// It is what a layout asks before drawing the banner. A page with no errors must
+// not draw an empty one: a box that is always there and usually blank is a box
+// people stop reading, which is how a real message goes unseen.
+func (p Page) Any() bool { return len(p.Errors) > 0 }
+
+// OldValue is what was typed in a field on the attempt that was rejected.
+//
+//	Value: .OldValue("email")
+//
+// Always empty for a password, by construction rather than by the screen
+// remembering to leave it out. See session.Flash.
+func (p Page) OldValue(name string) string { return p.Old.Get(name) }
+
+// OldOr is OldValue, falling back to what the field already held.
+//
+// It is what an edit form needs and a create form does not: the box starts at
+// the stored value, and comes back carrying the rejected edit rather than
+// reverting to what is in the database -- which would quietly undo the change
+// somebody is in the middle of making.
+//
+// It answers the fallback when nothing was flashed, and the flashed value even
+// when that value is empty: a field somebody deliberately cleared must not fill
+// itself back in.
+func (p Page) OldOr(name, fallback string) string {
+	if _, typed := p.Old[name]; typed {
+		return p.Old.Get(name)
+	}
+	return fallback
+}
+
+// All is one line per failed field, for the banner, in sorted field
+// order.
+//
+//	Password must be at least 12 characters
+//
+// The field name is prepended HERE and not baked into the message itself, so
+// a message reads bare where it is drawn in context, and named where it is
+// drawn out of context, and there is one message either way.
+//
+// Sorted rather than in map order, so the banner does not reshuffle between two
+// renders of the same failure.
+// displayableAttribute turns a field name into the form a message names it
+// by: snake case with underscores opened into spaces.
+//
+// It is snake case with the underscores opened out, and nothing else: a field
+// named password_confirmation reads "password confirmation", not "Password
+// Confirmation". That is str.Headline, which is what titles are for -- a
+// message reads "the password confirmation field must match", with the name
+// inside the sentence and lowercase.
+//
+// The first letter is raised because the name opens the line here rather than
+// sitting inside a sentence.
+//
+// Custom display names for a field, when a project wants to declare them,
+// are not read yet. When they are, they are read here, so that the banner
+// and the field label cannot disagree.
+func displayableAttribute(field string) string {
+	return str.Ucfirst(strings.ReplaceAll(str.Snake(field, "_"), "_", " "))
+}
+
+// All returns every message, one line per failed field, for the banner.
+//
+// Each line is prefixed with the field's displayable name, since the message
+// itself does not carry the field name.
+//
+// Nil rather than empty on a page with no errors, so a layout that ranges over
+// it draws no banner at all.
+func (p Page) All() []string {
+	if len(p.Errors) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(p.Errors))
+	for _, field := range p.Errors.Keys() {
+		for _, msg := range p.Errors.Get(field) {
+			out = append(out, displayableAttribute(field)+" "+msg)
+		}
+	}
+	return out
+}
