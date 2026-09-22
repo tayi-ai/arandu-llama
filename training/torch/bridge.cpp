@@ -4,6 +4,7 @@
 #include <torch/torch.h>
 #include <torch/version.h>
 #include <ATen/CPUGeneratorImpl.h>
+#include <c10/core/DeviceGuard.h>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -132,6 +133,9 @@ extern "C" tayi_torch_result tayi_torch_create(const void *data, int64_t bytes,
     checked(result.error, sizeof(result.error), [&] {
         little_endian();
         const auto sizes = dimensions(shape, rank);
+        const auto destination = device_type(device);
+        c10::OptionalDeviceGuard device_guard;
+        if (destination.is_cuda()) device_guard.reset_device(destination);
         auto options = torch::TensorOptions().dtype(scalar_type(dtype)).device(torch::kCPU);
         int64_t elements = 1;
         for (int64_t size : sizes) elements *= size;
@@ -142,7 +146,7 @@ extern "C" tayi_torch_result tayi_torch_create(const void *data, int64_t bytes,
         // Copy before returning: native tensors must never retain Go pointers.
         auto value = torch::empty(sizes, options);
         if (bytes) std::memcpy(value.data_ptr(), data, static_cast<size_t>(bytes));
-        value = value.to(device_type(device));
+        value = value.to(destination);
         value.requires_grad_(requires_grad != 0);
         result.tensor = new tayi_torch_tensor{std::move(value)};
     });
@@ -156,6 +160,8 @@ extern "C" tayi_torch_result tayi_torch_apply(int operation, tayi_torch_tensor *
         auto values = tensor_list(inputs, count);
         if (integer_count && !integers) throw std::invalid_argument("null integer arguments");
         const auto &a = values[0];
+        c10::OptionalDeviceGuard device_guard;
+        if (a.device().is_cuda()) device_guard.reset_device(a.device());
         auto integer = [&](size_t i) -> int64_t {
             if (i >= integer_count) throw std::invalid_argument("missing integer argument");
             return integers[i];
@@ -262,6 +268,8 @@ extern "C" int tayi_torch_copy(tayi_torch_tensor *handle, int dtype, void *data,
     return checked(error, capacity, [&] {
         little_endian();
         const auto &input = tensor(handle);
+        c10::OptionalDeviceGuard device_guard;
+        if (input.device().is_cuda()) device_guard.reset_device(input.device());
         const int64_t width = c10::elementSize(scalar_type(dtype));
         if (bytes < 0 || input.numel() > std::numeric_limits<int64_t>::max()/width ||
             bytes != input.numel()*width || (bytes && !data))
@@ -277,7 +285,10 @@ extern "C" int tayi_torch_grad(tayi_torch_tensor *const *outputs, size_t output_
         int retain_graph, int create_graph, tayi_torch_tensor **gradients, char *error, size_t capacity) {
     return checked(error, capacity, [&] {
         if (!gradients) throw std::invalid_argument("null gradient destination");
-        auto result = torch::autograd::grad(tensor_list(outputs, output_count), tensor_list(inputs, input_count),
+        auto output_values = tensor_list(outputs, output_count);
+        c10::OptionalDeviceGuard device_guard;
+        if (output_values[0].device().is_cuda()) device_guard.reset_device(output_values[0].device());
+        auto result = torch::autograd::grad(output_values, tensor_list(inputs, input_count),
             tensor_list(cotangents, output_count), retain_graph != 0, create_graph != 0, false);
         std::vector<std::unique_ptr<tayi_torch_tensor>> owned;
         owned.reserve(input_count);
@@ -291,7 +302,12 @@ extern "C" int tayi_torch_grad(tayi_torch_tensor *const *outputs, size_t output_
 }
 
 extern "C" int tayi_torch_close(tayi_torch_tensor *handle, char *error, size_t capacity) {
-    return checked(error, capacity, [&] { delete handle; });
+    return checked(error, capacity, [&] {
+        const auto device = tensor(handle).device();
+        c10::OptionalDeviceGuard device_guard;
+        if (device.is_cuda()) device_guard.reset_device(device);
+        delete handle;
+    });
 }
 
 extern "C" const char *tayi_torch_header_version(void) { return TORCH_VERSION; }
