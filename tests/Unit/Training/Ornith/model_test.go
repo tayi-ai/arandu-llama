@@ -486,6 +486,12 @@ func TestCancellationAndCotangentValidation(t *testing.T) {
 func TestStorageCastsAndFrozenWeights(t *testing.T) {
 	f := newFixture(t, torch.Float16)
 	before := baseHash(t, f)
+	underBudget := f.limits
+	underBudget.MaxCheckpointBytes = 1607
+	if value, err := f.model.Forward(context.Background(), f.tokens, underBudget); value != nil || err == nil {
+		_ = value.Close()
+		t.Fatal("FP32 residual checkpoint budget was underestimated")
+	}
 	snapshot := forward(t, f)
 	assertDetachedFinite(t, snapshot.Logits, torch.Float32)
 	gradients := backward(t, f, snapshot)

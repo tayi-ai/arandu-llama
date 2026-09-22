@@ -193,15 +193,49 @@ func normalize(x, weight, gate *torch.Tensor, epsilon float64) (*torch.Tensor, e
 }
 
 // FeedForward computes the bias-free SwiGLU block used by the text model:
-// down(SiLU(gate(x)) * up(x)). Parameters and precision remain caller-owned.
+// down(SiLU(gate(x)) * up(x)). A Float32 residual stream may consume frozen
+// Float16 checkpoint weights; those weights are promoted only for this block.
+// This preserves the dynamic range Qwen3.5 normally obtains from BFloat16 on
+// devices where BFloat16 execution is unavailable. Borrowed parameters remain
+// unchanged and gradients continue to propagate only to the input.
 func FeedForward(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tensor, error) {
+	if x == nil || gateWeight == nil || upWeight == nil || downWeight == nil {
+		return nil, errors.New("layers: feed-forward requires input and weights")
+	}
+	xInfo, err := x.Info()
+	if err != nil {
+		return nil, err
+	}
 	var s scope
 	defer s.close()
-	gate := s.run(func() (*torch.Tensor, error) { return Linear(x, gateWeight) })
+	promote := func(weight *torch.Tensor) *torch.Tensor {
+		if s.err != nil {
+			return nil
+		}
+		info, infoErr := weight.Info()
+		if infoErr != nil {
+			s.err = infoErr
+			return nil
+		}
+		if info.Device != xInfo.Device || info.RequiresGrad {
+			s.err = errors.New("layers: feed-forward weights must be frozen on the input device")
+			return nil
+		}
+		if info.DType == xInfo.DType {
+			return weight
+		}
+		if xInfo.DType != torch.Float32 || info.DType != torch.Float16 {
+			s.err = errors.New("layers: unsupported feed-forward mixed precision")
+			return nil
+		}
+		return s.run(func() (*torch.Tensor, error) { return weight.To(xInfo.Device, torch.Float32) })
+	}
+	gateBase, upBase, downBase := promote(gateWeight), promote(upWeight), promote(downWeight)
+	gate := s.run(func() (*torch.Tensor, error) { return Linear(x, gateBase) })
 	gate = s.run(func() (*torch.Tensor, error) { return gate.SiLU() })
-	up := s.run(func() (*torch.Tensor, error) { return Linear(x, upWeight) })
+	up := s.run(func() (*torch.Tensor, error) { return Linear(x, upBase) })
 	product := s.run(func() (*torch.Tensor, error) { return gate.Mul(up) })
-	result := s.run(func() (*torch.Tensor, error) { return Linear(product, downWeight) })
+	result := s.run(func() (*torch.Tensor, error) { return Linear(product, downBase) })
 	return s.result(result)
 }
 
