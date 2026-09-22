@@ -157,8 +157,13 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 		s.err = err
 		return nil, nil, nil
 	}
-	normalized := s.run(func() (*torch.Tensor, error) { return RMSNorm(input, weights.InputNorm, config.Epsilon) })
-	attentionInput = s.run(func() (*torch.Tensor, error) { return normalized.To(info.Device, torch.Float32) })
+	// Attention is admitted in Float32. Promote before RMSNorm so a finite
+	// normalized activation is never rounded through Float16 and turned into
+	// an infinity before entering either attention implementation. The
+	// residual and MLP paths retain the qualified checkpoint storage dtype.
+	attentionSource := s.run(func() (*torch.Tensor, error) { return input.To(info.Device, torch.Float32) })
+	normalized := s.run(func() (*torch.Tensor, error) { return RMSNorm(attentionSource, weights.InputNorm, config.Epsilon) })
+	attentionInput = normalized
 	if weights.Full != nil {
 		attentionOutput = s.run(func() (*torch.Tensor, error) {
 			return FullAttention(attentionInput, *weights.Full, adapter, cosine, sine, config.Full)

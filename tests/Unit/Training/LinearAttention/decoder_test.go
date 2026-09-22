@@ -9,7 +9,58 @@ import (
 	"testing"
 
 	"github.com/tayi-ai/arandu-llama/training/layers"
+	"github.com/tayi-ai/arandu-llama/training/torch"
 )
+
+func TestFP16DecoderNormalizesAttentionBeforeStorageRounding(t *testing.T) {
+	f := newFixture()
+	for row := 0; row < f.batch*f.tokens; row++ {
+		copy(f.x[row*f.hidden:(row+1)*f.hidden], []float32{1, 0, 0})
+	}
+	shrink := func(values []float32) []float32 {
+		result := append([]float32(nil), values...)
+		for index := range result {
+			result[index] *= 1e-4
+		}
+		return result
+	}
+	f.qkv, f.z, f.beta, f.alpha, f.conv, f.out = shrink(f.qkv), shrink(f.z), shrink(f.beta), shrink(f.alpha), shrink(f.conv), shrink(f.out)
+	_, attention := f.tensors(t, false)
+	half := func(values []float32, shape []int64, requiresGrad bool) *torch.Tensor {
+		base := tensor(t, values, shape, requiresGrad)
+		return own(t, base.To(torch.CPUDevice(), torch.Float16))
+	}
+	d := int64(f.hidden)
+	x := half(f.x, []int64{int64(f.batch), int64(f.tokens), d}, true)
+	inputNorm := half([]float32{40000, 0, 0}, []int64{d}, false)
+	weights := layers.DecoderWeights{
+		InputNorm:         inputNorm,
+		PostAttentionNorm: half(data(f.hidden, 0.8, 0.1), []int64{d}, false),
+		Gate:              half(data(5*f.hidden, 0.3, 0.04), []int64{5, d}, false),
+		Up:                half(data(5*f.hidden, 0.7, 0.04), []int64{5, d}, false),
+		Down:              half(data(f.hidden*5, 0.5, 0.04), []int64{d, 5}, false),
+		Linear:            &attention,
+	}
+	x32 := own(t, x.To(torch.CPUDevice(), torch.Float32))
+	normalized := own(t, layers.RMSNorm(x32, inputNorm, 1e-4))
+	peak := float32(0)
+	for _, value := range read(t, normalized) {
+		peak = max(peak, float32(math.Abs(float64(value))))
+	}
+	if peak <= 65504 {
+		t.Fatalf("test did not exceed Float16 range: %g", peak)
+	}
+	config := layers.DecoderConfig{Epsilon: 1e-4, MaxInputElements: int64(len(f.x)), Linear: f.config}
+	output := own(t, layers.DecoderForward(context.Background(), x, weights, nil, nil, nil, config))
+	finite, err := output.AllFinite()
+	if err != nil || !finite {
+		t.Fatalf("attention normalization rounded through Float16: %v", err)
+	}
+	info, err := output.Info()
+	if err != nil || info.DType != torch.Float16 {
+		t.Fatalf("qualified residual storage changed: %+v, %v", info, err)
+	}
+}
 
 // A scalar decoder oracle exercises both residual paths, both normalizations,
 // and the recurrent input gradient after the independent MLP graph is consumed.
