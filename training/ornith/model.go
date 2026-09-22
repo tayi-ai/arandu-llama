@@ -162,6 +162,12 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 		if err != nil {
 			return nil, fmt.Errorf("ornith: layer %d forward: %w", index, err)
 		}
+		rounded, err := current.RoundBFloat16()
+		if err != nil {
+			return nil, fmt.Errorf("ornith: layer %d residual rounding: %w", index, err)
+		}
+		_ = current.Close()
+		current = rounded
 		if err = observeForward(ctx, observer, StageAfterDecoder, index, current); err != nil {
 			return nil, err
 		}

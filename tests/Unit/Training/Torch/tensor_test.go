@@ -414,6 +414,54 @@ func TestNativeAutogradHigherOrderAndFailures(t *testing.T) {
 	workers.Wait()
 }
 
+func TestBFloat16RoundingReturnsFloat32AndPreservesGradient(t *testing.T) {
+	keep := scope(t)
+	source := []float32{1.00390625, -2.01171875, 65536, 1e-30}
+	x := keep(torch.FromFloat32(source, []int64{4}, torch.CPUDevice(), true))
+	rounded := keep(x.RoundBFloat16())
+	info, err := rounded.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.DType != torch.Float32 || info.Device != torch.CPUDevice() || !info.RequiresGrad {
+		t.Fatalf("rounded metadata: %+v", info)
+	}
+	actual, err := rounded.Float32Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, value := range actual {
+		if !isFinite32(value) || math.Float32bits(value)&0xffff != 0 {
+			t.Fatalf("value %d was not rounded to the bfloat16 grid: %08x", index, math.Float32bits(value))
+		}
+	}
+	seed := keep(torch.FromFloat32([]float32{1, 1, 1, 1}, []int64{4}, torch.CPUDevice(), false))
+	gradients, err := torch.Grad([]*torch.Tensor{rounded}, []*torch.Tensor{x}, []*torch.Tensor{seed}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, values(t, keep(gradients[0], nil)), []float64{1, 1, 1, 1}, 0)
+
+	half := keep(rounded.To(torch.CPUDevice(), torch.Float16))
+	if invalid, err := half.RoundBFloat16(); err == nil {
+		_ = invalid.Close()
+		t.Fatal("non-Float32 rounding input accepted")
+	}
+}
+
+func isFinite32(value float32) bool {
+	return !float32IsNaN(value) && !float32IsInf(value)
+}
+
+func float32IsNaN(value float32) bool {
+	bits := math.Float32bits(value)
+	return bits&0x7f800000 == 0x7f800000 && bits&0x007fffff != 0
+}
+
+func float32IsInf(value float32) bool {
+	return math.Float32bits(value)&0x7fffffff == 0x7f800000
+}
+
 func TestNativeConcurrentCloseAndRead(t *testing.T) {
 	keep := scope(t)
 	x := keep(torch.FromFloat32([]float32{1, 2}, []int64{2}, torch.CPUDevice(), false))

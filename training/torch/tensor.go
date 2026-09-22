@@ -436,6 +436,27 @@ func (t *Tensor) To(device Device, dtype DType) (*Tensor, error) {
 	return apply(opTo, []*Tensor{t}, []int64{int64(index), int64(dtype)}, 0)
 }
 
+// RoundBFloat16 rounds Float32 values to the BFloat16 value grid while
+// returning Float32 storage on the same device. Both casts remain in the
+// autograd graph, so gradients can cross a model boundary without retaining
+// the narrow BFloat16 storage used only for rounding.
+func (t *Tensor) RoundBFloat16() (*Tensor, error) {
+	info, err := t.Info()
+	if err != nil {
+		return nil, err
+	}
+	if info.DType != Float32 {
+		return nil, errors.New("torch: bfloat16 rounding requires Float32 input")
+	}
+	rounded, err := t.To(info.Device, BFloat16)
+	if err != nil {
+		return nil, err
+	}
+	result, err := rounded.To(info.Device, Float32)
+	_ = rounded.Close()
+	return result, err
+}
+
 // Clone copies storage and preserves autograd history.
 func (t *Tensor) Clone() (*Tensor, error) { return apply(opClone, []*Tensor{t}, nil, 0) }
 
