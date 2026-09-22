@@ -205,6 +205,48 @@ func FeedForward(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tens
 	return s.result(result)
 }
 
+// FeedForwardPromoted computes SwiGLU in Float32 while leaving frozen Float16
+// checkpoint weights unchanged. Qwen3.5 checkpoints are BFloat16; this keeps
+// their exponent range on Turing devices, where native BFloat16 execution is
+// unavailable, without changing the admitted Float16 residual checkpoints.
+func FeedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tensor, error) {
+	if x == nil || gateWeight == nil || upWeight == nil || downWeight == nil {
+		return nil, errors.New("layers: promoted feed-forward requires input and weights")
+	}
+	xInfo, err := x.Info()
+	if err != nil {
+		return nil, err
+	}
+	if xInfo.DType != torch.Float16 && xInfo.DType != torch.Float32 {
+		return nil, errors.New("layers: promoted feed-forward requires Float16 or Float32 input")
+	}
+	var s scope
+	defer s.close()
+	promote := func(value *torch.Tensor) *torch.Tensor {
+		if s.err != nil {
+			return nil
+		}
+		info, infoErr := value.Info()
+		if infoErr != nil {
+			s.err = infoErr
+			return nil
+		}
+		if info.Device != xInfo.Device || info.RequiresGrad || (info.DType != torch.Float16 && info.DType != torch.Float32) {
+			s.err = errors.New("layers: promoted feed-forward weights must be frozen floating-point tensors on the input device")
+			return nil
+		}
+		return s.run(func() (*torch.Tensor, error) { return value.To(xInfo.Device, torch.Float32) })
+	}
+	input := s.run(func() (*torch.Tensor, error) { return x.To(xInfo.Device, torch.Float32) })
+	gateBase, upBase, downBase := promote(gateWeight), promote(upWeight), promote(downWeight)
+	gate := s.run(func() (*torch.Tensor, error) { return Linear(input, gateBase) })
+	gate = s.run(func() (*torch.Tensor, error) { return gate.SiLU() })
+	up := s.run(func() (*torch.Tensor, error) { return Linear(input, upBase) })
+	product := s.run(func() (*torch.Tensor, error) { return gate.Mul(up) })
+	result := s.run(func() (*torch.Tensor, error) { return Linear(product, downBase) })
+	return s.result(result)
+}
+
 func positiveFinite(value float64) bool {
 	return value > 0 && !math.IsInf(value, 0) && !math.IsNaN(value)
 }

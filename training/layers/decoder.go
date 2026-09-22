@@ -39,7 +39,8 @@ func (g *DecoderGradients) Close() error {
 
 // DecoderForward computes a complete decoder block and returns detached output.
 // The caller checkpoints the input and invokes DecoderVJP when backpropagating.
-// Attention runs in Float32; residuals and MLP retain the input dtype.
+// Attention and MLP arithmetic run in Float32; residual checkpoints retain the
+// admitted input dtype.
 func DecoderForward(ctx context.Context, x *torch.Tensor, weights DecoderWeights, adapter *AttentionLoRA, cosine, sine *torch.Tensor, config DecoderConfig) (*torch.Tensor, error) {
 	if err := decoderValidate(ctx, x, weights, adapter, config); err != nil {
 		return nil, err
@@ -179,8 +180,11 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 	attentionStorage := s.run(func() (*torch.Tensor, error) { return attentionOutput.To(info.Device, info.DType) })
 	residual := s.run(func() (*torch.Tensor, error) { return input.Add(attentionStorage) })
 	normalized = s.run(func() (*torch.Tensor, error) { return RMSNorm(residual, weights.PostAttentionNorm, config.Epsilon) })
-	feedForward := s.run(func() (*torch.Tensor, error) { return FeedForward(normalized, weights.Gate, weights.Up, weights.Down) })
-	output = s.run(func() (*torch.Tensor, error) { return residual.Add(feedForward) })
+	feedForward := s.run(func() (*torch.Tensor, error) {
+		return FeedForwardPromoted(normalized, weights.Gate, weights.Up, weights.Down)
+	})
+	feedForwardStorage := s.run(func() (*torch.Tensor, error) { return feedForward.To(info.Device, info.DType) })
+	output = s.run(func() (*torch.Tensor, error) { return residual.Add(feedForwardStorage) })
 	return output, attentionInput, attentionOutput
 }
 

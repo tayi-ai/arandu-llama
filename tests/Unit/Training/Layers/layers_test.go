@@ -225,3 +225,28 @@ func TestFrozenFeedForwardStillPropagatesInputGradient(t *testing.T) {
 	near(t, values(t, result), expected, 1e-12)
 	near(t, values(t, gradients[0]), derivative, 1e-12)
 }
+
+func TestPromotedFeedForwardPreservesBFloat16DynamicRange(t *testing.T) {
+	input32 := tensor32(t, []float64{1}, []int64{1, 1}, true)
+	to16 := func(value float64) *torch.Tensor {
+		base := tensor32(t, []float64{value}, []int64{1, 1}, false)
+		converted, err := base.To(torch.CPUDevice(), torch.Float16)
+		return own(t, converted, err)
+	}
+	input16, err := input32.To(torch.CPUDevice(), torch.Float16)
+	input16 = own(t, input16, err)
+	result, err := layers.FeedForwardPromoted(input16, to16(400), to16(400), to16(0.001))
+	result = own(t, result, err)
+	info, err := result.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finite, err := result.AllFinite()
+	if err != nil || !finite || info.DType != torch.Float32 {
+		t.Fatalf("promoted SwiGLU is not finite Float32: info=%+v finite=%v err=%v", info, finite, err)
+	}
+	got := values(t, result)[0]
+	if got < 159.9 || got > 160.2 {
+		t.Fatalf("promoted SwiGLU lost the expected dynamic range: %.9g", got)
+	}
+}
