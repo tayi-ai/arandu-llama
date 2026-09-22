@@ -71,11 +71,7 @@ func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, ad
 	if err != nil {
 		return nil, err
 	}
-	outputDType := xInfo.DType
-	if outputDType == torch.Float16 {
-		outputDType = torch.Float32
-	}
-	if !equalShape(xInfo.Shape, dInfo.Shape) || outputDType != dInfo.DType || xInfo.Device != dInfo.Device {
+	if !equalShape(xInfo.Shape, dInfo.Shape) || xInfo.DType != dInfo.DType || xInfo.Device != dInfo.Device {
 		return nil, errors.New("layers: decoder cotangent geometry or placement differs")
 	}
 	finite, err := cotangent.AllFinite()
@@ -161,15 +157,7 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 		s.err = err
 		return nil, nil, nil
 	}
-	// Turing GPUs do not provide the BFloat16 residual range used by the
-	// reference model. Keep the residual stream and SwiGLU arithmetic in FP32;
-	// frozen MLP weights remain stored in FP16 and are promoted per block.
-	residualInput := input
-	if info.DType == torch.Float16 {
-		residualInput = s.run(func() (*torch.Tensor, error) { return input.To(info.Device, torch.Float32) })
-		info.DType = torch.Float32
-	}
-	normalized := s.run(func() (*torch.Tensor, error) { return RMSNorm(residualInput, weights.InputNorm, config.Epsilon) })
+	normalized := s.run(func() (*torch.Tensor, error) { return RMSNorm(input, weights.InputNorm, config.Epsilon) })
 	attentionInput = s.run(func() (*torch.Tensor, error) { return normalized.To(info.Device, torch.Float32) })
 	if weights.Full != nil {
 		attentionOutput = s.run(func() (*torch.Tensor, error) {
@@ -184,7 +172,7 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 		}
 	}
 	attentionStorage := s.run(func() (*torch.Tensor, error) { return attentionOutput.To(info.Device, info.DType) })
-	residual := s.run(func() (*torch.Tensor, error) { return residualInput.Add(attentionStorage) })
+	residual := s.run(func() (*torch.Tensor, error) { return input.Add(attentionStorage) })
 	normalized = s.run(func() (*torch.Tensor, error) { return RMSNorm(residual, weights.PostAttentionNorm, config.Epsilon) })
 	feedForward := s.run(func() (*torch.Tensor, error) { return FeedForward(normalized, weights.Gate, weights.Up, weights.Down) })
 	output = s.run(func() (*torch.Tensor, error) { return residual.Add(feedForward) })
@@ -217,8 +205,7 @@ func decoderValidate(ctx context.Context, x *torch.Tensor, weights DecoderWeight
 		if err != nil {
 			return err
 		}
-		mixedFloat32 := info.DType == torch.Float32 && w.DType == torch.Float16
-		if w.RequiresGrad || w.Device != info.Device || (w.DType != info.DType && !mixedFloat32) {
+		if w.RequiresGrad || w.Device != info.Device || w.DType != info.DType {
 			return errors.New("layers: decoder storage weights must be frozen and match input placement and dtype")
 		}
 	}

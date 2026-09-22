@@ -57,17 +57,13 @@ func TestObservedForwardPreservesValuesAndReportsEveryPlacement(t *testing.T) {
 			previous := observations[0].SHA256
 			for layer := range f.model.Layers {
 				before, after, decoded := observations[1+3*layer], observations[2+3*layer], observations[3+3*layer]
-				placementDType := dtype
-				if dtype == torch.Float16 && layer > 0 {
-					placementDType = torch.Float32
-				}
-				if before.Stage != ornith.StageBeforePlacement || after.Stage != ornith.StageAfterPlacement || decoded.Stage != ornith.StageAfterDecoder || before.Layer != layer || after.Layer != layer || decoded.Layer != layer || before.SHA256 != previous || after.SHA256 != before.SHA256 || before.DType != placementDType || after.DType != placementDType || decoded.DType != torch.Float32 {
+				if before.Stage != ornith.StageBeforePlacement || after.Stage != ornith.StageAfterPlacement || decoded.Stage != ornith.StageAfterDecoder || before.Layer != layer || after.Layer != layer || decoded.Layer != layer || before.SHA256 != previous || after.SHA256 != before.SHA256 || before.DType != dtype || after.DType != dtype {
 					t.Fatalf("layer %d placement attribution differs", layer)
 				}
 				previous = decoded.SHA256
 			}
 			norm, logits := observations[len(observations)-2], observations[len(observations)-1]
-			if norm.Stage != ornith.StageFinalNorm || norm.Layer != -1 || !slices.Equal(norm.Shape, []int64{1, 3, 4}) || norm.DType != torch.Float32 || logits.Stage != ornith.StageLogits || logits.Layer != -1 || logits.DType != torch.Float32 || !slices.Equal(logits.Shape, []int64{1, 2, 6}) {
+			if norm.Stage != ornith.StageFinalNorm || norm.Layer != -1 || !slices.Equal(norm.Shape, []int64{1, 3, 4}) || norm.DType != dtype || logits.Stage != ornith.StageLogits || logits.Layer != -1 || logits.DType != torch.Float32 || !slices.Equal(logits.Shape, []int64{1, 2, 6}) {
 				t.Fatal("final normalization or logit identity differs")
 			}
 			body, err := observed.Logits.Bytes()

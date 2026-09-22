@@ -225,35 +225,3 @@ func TestFrozenFeedForwardStillPropagatesInputGradient(t *testing.T) {
 	near(t, values(t, result), expected, 1e-12)
 	near(t, values(t, gradients[0]), derivative, 1e-12)
 }
-
-func TestFeedForwardPromotesFrozenFloat16WeightsForFloat32Residual(t *testing.T) {
-	x := tensor32(t, []float64{1}, []int64{1, 1}, true)
-	weight16 := func(value float64) *torch.Tensor {
-		base := tensor32(t, []float64{value}, []int64{1, 1}, false)
-		converted, err := base.To(torch.CPUDevice(), torch.Float16)
-		return own(t, converted, err)
-	}
-	result, err := layers.FeedForward(x, weight16(400), weight16(400), weight16(1))
-	result = own(t, result, err)
-	info, err := result.Info()
-	if err != nil {
-		t.Fatal(err)
-	}
-	finite, err := result.AllFinite()
-	if err != nil || !finite || info.DType != torch.Float32 {
-		t.Fatalf("mixed-precision result is not finite Float32: info=%+v finite=%v err=%v", info, finite, err)
-	}
-	got := values(t, result)[0]
-	if got < 159999 || got > 160001 || got <= 65504 {
-		t.Fatalf("mixed-precision SwiGLU lost FP32 dynamic range: %.9g", got)
-	}
-	gradients, err := torch.Grad([]*torch.Tensor{result}, []*torch.Tensor{x}, []*torch.Tensor{tensor32(t, []float64{1}, []int64{1, 1}, false)}, false, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closeGradients(t, gradients)
-	finite, err = gradients[0].AllFinite()
-	if err != nil || !finite {
-		t.Fatalf("mixed-precision input gradient is not finite: finite=%v err=%v", finite, err)
-	}
-}

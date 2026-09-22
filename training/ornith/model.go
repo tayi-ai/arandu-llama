@@ -145,11 +145,7 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 		if err = observeForward(ctx, observer, StageBeforePlacement, index, current); err != nil {
 			return nil, err
 		}
-		currentInfo, err := current.Info()
-		if err != nil {
-			return nil, fmt.Errorf("ornith: layer %d input metadata: %w", index, err)
-		}
-		placed, err := current.To(layer.Device, currentInfo.DType)
+		placed, err := current.To(layer.Device, info.DType)
 		if err != nil {
 			return nil, fmt.Errorf("ornith: layer %d input placement: %w", index, err)
 		}
@@ -162,12 +158,6 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 		if err != nil {
 			return nil, fmt.Errorf("ornith: layer %d forward: %w", index, err)
 		}
-		rounded, err := current.RoundBFloat16()
-		if err != nil {
-			return nil, fmt.Errorf("ornith: layer %d residual rounding: %w", index, err)
-		}
-		_ = current.Close()
-		current = rounded
 		if err = observeForward(ctx, observer, StageAfterDecoder, index, current); err != nil {
 			return nil, err
 		}
@@ -274,11 +264,7 @@ func (m *TextModel) VJP(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		if err != nil {
 			return nil, err
 		}
-		cotangentDType := stateInfo.DType
-		if cotangentDType == torch.Float16 {
-			cotangentDType = torch.Float32
-		}
-		placed, err := current.To(layer.Device, cotangentDType)
+		placed, err := current.To(layer.Device, stateInfo.DType)
 		if err != nil {
 			return nil, err
 		}
@@ -334,19 +320,7 @@ func (m *TextModel) headObserved(ctx context.Context, hidden *torch.Tensor, coun
 		return nil, err
 	}
 	defer last.Close()
-	headInfo, err := m.Head.Info()
-	if err != nil {
-		return nil, err
-	}
-	headInput := last
-	if headInfo.DType != info.DType {
-		headInput, err = last.To(headInfo.Device, headInfo.DType)
-		if err != nil {
-			return nil, err
-		}
-		defer headInput.Close()
-	}
-	logits, err := layers.Linear(headInput, m.Head)
+	logits, err := layers.Linear(last, m.Head)
 	if err != nil {
 		return nil, err
 	}
@@ -371,20 +345,15 @@ func (m *TextModel) validate(ctx context.Context, tokens []int64, limits Limits)
 	if len(info.Shape) != 2 || info.Shape[0] <= 0 || info.Shape[1] <= 0 || info.RequiresGrad || (info.DType != torch.Float16 && info.DType != torch.Float32) {
 		return torch.Info{}, errors.New("ornith: token embedding must be frozen Float16 or Float32")
 	}
-	// One placement retains embedding precision. Every later placement, the
-	// final checkpoint and one conservative live boundary use the FP32 residual
-	// stream. Float32 embeddings use the original uniform calculation.
-	bytesPerElement := int64(4 * (len(m.Layers) + 2))
-	if info.DType == torch.Float16 {
-		bytesPerElement = 2 + int64(4*(len(m.Layers)+1))
+	bytes := int64(2)
+	if info.DType == torch.Float32 {
+		bytes = 4
 	}
-	elements := int64(len(tokens))
-	if elements > limits.MaxCheckpointBytes/info.Shape[1] {
-		return torch.Info{}, errors.New("ornith: activation checkpoint budget exceeded")
-	}
-	elements *= info.Shape[1]
-	if bytesPerElement <= 0 || elements > limits.MaxCheckpointBytes/bytesPerElement {
-		return torch.Info{}, errors.New("ornith: activation checkpoint budget exceeded")
+	for _, dimension := range []int64{int64(len(tokens)), info.Shape[1], int64(len(m.Layers)) + 2} {
+		if bytes > limits.MaxCheckpointBytes/dimension {
+			return torch.Info{}, errors.New("ornith: activation checkpoint budget exceeded")
+		}
+		bytes *= dimension
 	}
 	for _, id := range tokens {
 		if id < 0 || id >= info.Shape[0] {

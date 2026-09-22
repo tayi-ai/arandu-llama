@@ -275,35 +275,87 @@ func parameter(adapter *layers.AttentionLoRA, index int) **torch.Tensor {
 	}
 }
 
-func TestFirstAndLastAdaptersPreserveGradientsAcrossBFloat16Boundaries(t *testing.T) {
+func scalarLoss(t *testing.T, f *fixture) float64 {
+	t.Helper()
+	snapshot, err := f.model.Forward(context.Background(), f.tokens, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	var loss float64
+	for i, value := range read(t, snapshot.Logits) {
+		loss += float64(value) * float64(f.seed[i])
+	}
+	return loss
+}
+
+func TestFirstAndLastAdaptersMatchFreshForwardCentralDifferences(t *testing.T) {
 	f := newFixture(t, torch.Float32)
 	before := baseHash(t, f)
-	first := backward(t, f, forward(t, f))
-	second := backward(t, f, forward(t, f))
-	maxRepeatError := 0.0
-	for _, index := range []int{0, 1, 2, 3, 28, 29, 30, 31} {
-		left := read(t, first[index].Value)
-		right := read(t, second[index].Value)
-		l1 := 0.0
-		for coordinate := range left {
-			if math.IsNaN(float64(left[coordinate])) || math.IsInf(float64(left[coordinate]), 0) {
-				t.Fatalf("gradient%d coordinate%d is not finite", index, coordinate)
+	// Finish analytic backward before any replacement; never reuse a snapshot
+	// after changing the borrowed model's adapters.
+	snapshot := forward(t, f)
+	gradients := backward(t, f, snapshot)
+	_ = snapshot.Close()
+	maxAbsolute, maxRelative := 0.0, 0.0
+	for _, layer := range []int{3, 31} {
+		for kind := 0; kind < 4; kind++ {
+			gradient := read(t, gradients[(layer-3)/4*4+kind].Value)
+			// Choose the strongest coordinate for a meaningful FP32 signal, using
+			// the analytic gradient only to select which coordinate to perturb.
+			coordinate := 0
+			for i := range gradient {
+				if math.Abs(float64(gradient[i])) > math.Abs(float64(gradient[coordinate])) {
+					coordinate = i
+				}
 			}
-			l1 += math.Abs(float64(left[coordinate]))
-			error := math.Abs(float64(left[coordinate]) - float64(right[coordinate]))
-			maxRepeatError = math.Max(maxRepeatError, error)
-			if error > 1e-7+1e-5*math.Abs(float64(left[coordinate])) {
-				t.Fatalf("fresh forward changed gradient%d coordinate%d: %.9g != %.9g", index, coordinate, left[coordinate], right[coordinate])
+			pointer := parameter(f.model.Layers[layer].Adapter, kind)
+			original := *pointer
+			info, err := original.Info()
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if l1 <= 1e-8 {
-			t.Fatalf("gradient%d vanished across BF16 boundaries: %.9g", index, l1)
+			baseline := read(t, original)
+			for _, step := range []float32{0.001, 0.005} {
+				losses := [2]float64{}
+				coordinates := [2]float32{}
+				for direction, sign := range []float32{1, -1} {
+					perturbed := append([]float32(nil), baseline...)
+					perturbed[coordinate] += sign * step
+					coordinates[direction] = perturbed[coordinate]
+					replacement, err := torch.FromFloat32(perturbed, info.Shape, torch.CPUDevice(), true)
+					replacement = own(t, replacement, err)
+					*pointer = replacement
+					losses[direction] = scalarLoss(t, f)
+					*pointer = original
+					_ = replacement.Close()
+				}
+				finiteDifference := (losses[0] - losses[1]) / float64(coordinates[0]-coordinates[1])
+				analytic := float64(gradient[coordinate])
+				absolute := math.Abs(analytic - finiteDifference)
+				relative := absolute / math.Max(1e-8, math.Abs(analytic))
+				maxAbsolute = math.Max(maxAbsolute, absolute)
+				maxRelative = math.Max(maxRelative, relative)
+				// FP32 model outputs accumulate rounding through32 residual blocks.
+				// The absolute allowance is small compared with the selected signal.
+				tolerance := 8e-5 + 0.002*math.Abs(analytic)
+				if step == 0.005 {
+					tolerance = 2e-5 + 0.002*math.Abs(analytic)
+				}
+				if math.Abs(analytic) < 1e-5 {
+					t.Fatalf("weak derivative layer%d kind%d: %.9g", layer, kind, analytic)
+				}
+				if absolute > tolerance {
+					t.Fatalf("layer%d kind%d coordinate%d step%.3g analytic%.9g central%.9g error%.6g tolerance%.6g", layer, kind, coordinate, step, analytic, finiteDifference, absolute, tolerance)
+				}
+				t.Logf("layer%d kind%d coordinate%d step%.3g analytic%.9g central%.9g abs_error%.6g", layer, kind, coordinate, step, analytic, finiteDifference, absolute)
+			}
 		}
 	}
 	if baseHash(t, f) != before {
-		t.Fatal("gradient checks changed base weights")
+		t.Fatal("finite difference changed base weights")
 	}
-	t.Logf("first and last adapters remained finite and nonzero; fresh-forward maximum error %.9g", maxRepeatError)
+	t.Logf("16 central differences: maximum absolute error %.9g relative error %.6g", maxAbsolute, maxRelative)
 }
 
 func TestCheckpointAdmissionSnapshotOwnershipAndMissingAdapters(t *testing.T) {
@@ -434,12 +486,6 @@ func TestCancellationAndCotangentValidation(t *testing.T) {
 func TestStorageCastsAndFrozenWeights(t *testing.T) {
 	f := newFixture(t, torch.Float16)
 	before := baseHash(t, f)
-	underBudget := f.limits
-	underBudget.MaxCheckpointBytes = 1607
-	if value, err := f.model.Forward(context.Background(), f.tokens, underBudget); value != nil || err == nil {
-		_ = value.Close()
-		t.Fatal("FP32 residual checkpoint budget was underestimated")
-	}
 	snapshot := forward(t, f)
 	assertDetachedFinite(t, snapshot.Logits, torch.Float32)
 	gradients := backward(t, f, snapshot)
