@@ -256,6 +256,7 @@ const (
 	opAbs
 	opAMax
 	opClampMin
+	opAddScalar
 )
 
 func apply(op operation, tensors []*Tensor, integers []int64, scalar float64) (*Tensor, error) {
@@ -279,6 +280,14 @@ func (t *Tensor) MatMul(other *Tensor) (*Tensor, error) {
 // Add adds tensors with LibTorch broadcasting rules.
 func (t *Tensor) Add(other *Tensor) (*Tensor, error) {
 	return apply(opAdd, []*Tensor{t, other}, nil, 0)
+}
+
+// AddScalar adds a finite scalar without uploading a separate tensor to the device.
+func (t *Tensor) AddScalar(value float64) (*Tensor, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, errors.New("torch: add scalar must be finite")
+	}
+	return apply(opAddScalar, []*Tensor{t}, nil, value)
 }
 
 // Sub subtracts tensors with LibTorch broadcasting rules.

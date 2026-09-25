@@ -66,3 +66,42 @@ func TestMPSMemoryTelemetry(t *testing.T) {
 		t.Fatalf("invalid MPS allocator reading: %+v", stats)
 	}
 }
+
+func TestMPSAddScalarMatchesTensorAndPreservesGradient(t *testing.T) {
+	if !torch.MPSAvailable() {
+		t.Skip("MPS device is unavailable")
+	}
+	keep := scope(t)
+	x := keep(torch.FromFloat32([]float32{-2, 3}, []int64{2}, torch.MPSDevice(), true))
+	got := keep(x.AddScalar(1e-6))
+	epsilon := keep(torch.FromFloat32([]float32{1e-6}, []int64{1}, torch.MPSDevice(), false))
+	want := keep(x.Add(epsilon))
+	gotValues, err := got.Float32Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantValues, err := want.Float32Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range gotValues {
+		if gotValues[i] != wantValues[i] {
+			t.Fatalf("MPS scalar addition differs at %d: %g != %g", i, gotValues[i], wantValues[i])
+		}
+	}
+	seed := keep(torch.FromFloat32([]float32{1, 1}, []int64{2}, torch.MPSDevice(), false))
+	gradients, err := torch.Grad([]*torch.Tensor{got}, []*torch.Tensor{x}, []*torch.Tensor{seed}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := keep(gradients[0], nil).Float32Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0] != 1 || values[1] != 1 {
+		t.Fatalf("MPS scalar addition gradient differs: %v", values)
+	}
+	if _, err := x.AddScalar(math.NaN()); err == nil {
+		t.Fatal("non-finite scalar was accepted")
+	}
+}

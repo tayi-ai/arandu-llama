@@ -169,18 +169,12 @@ func normalize(x, weight, gate *torch.Tensor, epsilon float64) (*torch.Tensor, e
 	value := s.run(func() (*torch.Tensor, error) { return x.To(xInfo.Device, torch.Float32) })
 	square := s.run(func() (*torch.Tensor, error) { return value.Mul(value) })
 	mean := s.run(func() (*torch.Tensor, error) { return square.Mean([]int64{-1}, true) })
-	eps := s.run(func() (*torch.Tensor, error) {
-		return torch.FromFloat32([]float32{float32(epsilon)}, []int64{1}, xInfo.Device, false)
-	})
-	variance := s.run(func() (*torch.Tensor, error) { return mean.Add(eps) })
+	variance := s.run(func() (*torch.Tensor, error) { return mean.AddScalar(float64(float32(epsilon))) })
 	inverse := s.run(func() (*torch.Tensor, error) { return variance.RSqrt() })
 	unit := s.run(func() (*torch.Tensor, error) { return value.Mul(inverse) })
 	scale := s.run(func() (*torch.Tensor, error) { return weight.To(xInfo.Device, torch.Float32) })
 	if gate == nil {
-		one := s.run(func() (*torch.Tensor, error) {
-			return torch.FromFloat32([]float32{1}, []int64{1}, xInfo.Device, false)
-		})
-		scale = s.run(func() (*torch.Tensor, error) { return scale.Add(one) })
+		scale = s.run(func() (*torch.Tensor, error) { return scale.AddScalar(1) })
 	}
 	result := s.run(func() (*torch.Tensor, error) { return unit.Mul(scale) })
 	if gate != nil {

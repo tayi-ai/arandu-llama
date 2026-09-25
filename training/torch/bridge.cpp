@@ -266,6 +266,7 @@ extern "C" tayi_torch_result tayi_torch_apply(int operation, tayi_torch_tensor *
                 break;
             }
             case 36: output = a.clamp_min(scalar); break;
+            case 37: output = a + scalar; break;
             default: throw std::invalid_argument("unknown native tensor operation");
         }
         if (output.dim() > 32) throw std::invalid_argument("result rank exceeds 32");
