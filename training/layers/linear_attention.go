@@ -311,9 +311,15 @@ func validateLinearAttention(ctx context.Context, x *torch.Tensor, weights Linea
 		if !equalShape(actual.Shape, expected.shape) || actual.DType != torch.Float32 || actual.Device != geometry.device || (expected.frozen && actual.RequiresGrad) {
 			return fail("invalid linear-attention " + expected.name + " shape, dtype, device or frozen flag")
 		}
+		if os.Getenv("TAYI_TRACE_LINEAR") == "1" {
+			fmt.Fprintf(os.Stderr, "phase=linear_validate_start tensor=%s elements=%d\n", expected.name, actual.Elements)
+		}
 		finite, finiteErr := expected.value.AllFinite()
 		if finiteErr != nil {
 			return geometry, config, finiteErr
+		}
+		if os.Getenv("TAYI_TRACE_LINEAR") == "1" {
+			fmt.Fprintf(os.Stderr, "phase=linear_validate_end tensor=%s finite=%t\n", expected.name, finite)
 		}
 		if !finite {
 			return fail("nonfinite linear-attention " + expected.name)
