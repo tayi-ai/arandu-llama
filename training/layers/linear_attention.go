@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 
 	"github.com/tayi-ai/arandu-llama/training/sequence"
 	"github.com/tayi-ai/arandu-llama/training/tensor"
@@ -171,9 +173,16 @@ func (s *linearAttentionScope) runNamed(name string, operation func() (*torch.Te
 	if !s.check() {
 		return nil
 	}
+	trace := os.Getenv("TAYI_TRACE_LINEAR") == "1"
+	if trace {
+		fmt.Fprintf(os.Stderr, "phase=linear_op_start op=%s\n", name)
+	}
 	value := s.scope.run(operation)
 	if s.err == nil {
 		s.finiteNamed(name, value)
+	}
+	if trace {
+		fmt.Fprintf(os.Stderr, "phase=linear_op_end op=%s err=%v\n", name, s.err)
 	}
 	return value
 }
