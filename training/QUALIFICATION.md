@@ -98,6 +98,13 @@ quantized variants, quality gains, or a safe memory peak for long contexts.
 The local batch-one numerical mode is distinct from the frozen distributed
 20-rank optimizer protocol.
 
+The Go `training/optim` package now owns a batch-one AdamW update with
+validated, resumable FP32 parameters and moments. A second real Arandu example
+resumed from the first checkpoint and saved a second checkpoint: loss
+3.006498074 over 69 supervised tokens and 557053 changed parameters. A fresh
+process verified the saved adapter and reproduced its logits digest exactly.
+The parent project's evidence is `runtime/arasa-local-train-20260925/`.
+
 ## Remaining before full model training and promotion
 
 The local-first path needs durable multi-example optimizer/resume state,
