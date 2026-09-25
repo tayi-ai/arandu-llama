@@ -1,0 +1,245 @@
+//go:build libtorch && cgo
+
+package local
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/tayi-ai/arandu-llama/checkpoint"
+	"github.com/tayi-ai/arandu-llama/training/optim"
+	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/torch"
+)
+
+type stepManifest struct {
+	Step              uint64  `json:"step"`
+	ExampleID         string  `json:"example_id"`
+	SupervisedTokens  int     `json:"supervised_tokens"`
+	LossBefore        float64 `json:"loss_before"`
+	UpdatedAdapterSHA string  `json:"updated_adapter_sha256"`
+	AdapterFileSHA    string  `json:"adapter_file_sha256"`
+	OptimizerFileSHA  string  `json:"optimizer_file_sha256"`
+	LogitsAfterSHA    string  `json:"logits_after_sha256"`
+	BaseRevision      string  `json:"base_revision"`
+}
+
+func readFrozenTensorFile(ctx context.Context, path, expectedSHA string, names []string, shapes [][]int64) ([][]float32, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil || !stat.Mode().IsRegular() {
+		return nil, errors.New("checkpoint tensor file is not regular")
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil || hex.EncodeToString(h.Sum(nil)) != expectedSHA {
+		return nil, errors.New("checkpoint tensor file hash differs")
+	}
+	index, err := checkpoint.OpenSafetensors(file, stat.Size(), checkpoint.DefaultLimits())
+	if err != nil || len(index.Tensors()) != len(names) {
+		return nil, errors.New("checkpoint tensor index differs")
+	}
+	out := make([][]float32, len(names))
+	for i, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		item, ok := index.Tensor(name)
+		if !ok || item.DType != "F32" || len(item.Shape) != len(shapes[i]) {
+			return nil, fmt.Errorf("checkpoint tensor geometry differs: %s", name)
+		}
+		count := int64(1)
+		for j, dimension := range shapes[i] {
+			if item.Shape[j] != uint64(dimension) || dimension <= 0 {
+				return nil, fmt.Errorf("checkpoint tensor shape differs: %s", name)
+			}
+			count *= dimension
+		}
+		if item.Size() != count*4 {
+			return nil, fmt.Errorf("checkpoint tensor bytes differ: %s", name)
+		}
+		reader, err := index.TensorReader(name)
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(reader)
+		if err != nil || int64(len(data)) != count*4 {
+			return nil, errors.New("checkpoint tensor data incomplete")
+		}
+		values := make([]float32, count)
+		for j := range values {
+			values[j] = math.Float32frombits(binary.LittleEndian.Uint32(data[j*4:]))
+			if math.IsNaN(float64(values[j])) || math.IsInf(float64(values[j]), 0) {
+				return nil, errors.New("nonfinite checkpoint tensor")
+			}
+		}
+		out[i] = values
+	}
+	return out, nil
+}
+
+func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example, previous, output string) error {
+	started := time.Now()
+	memory := func(phase string) {
+		stats, err := torch.ReadMPSMemory()
+		if err == nil {
+			fmt.Printf("phase=mps_memory stage=%s current=%d driver=%d recommended=%d\n", phase, stats.CurrentAllocatedBytes, stats.DriverAllocatedBytes, stats.RecommendedMaxBytes)
+		}
+	}
+	body, err := os.ReadFile(filepath.Join(previous, "manifest.json"))
+	if err != nil {
+		return err
+	}
+	var prior stepManifest
+	if err := json.Unmarshal(body, &prior); err != nil || prior.Step == 0 || prior.BaseRevision != "489cb97981b8654bcfcf30ce1f94ed1b62e07b53" || prior.AdapterFileSHA == "" || prior.OptimizerFileSHA == "" || output == "" && prior.ExampleID != row.ID || output != "" && prior.ExampleID == row.ID {
+		return errors.New("previous checkpoint identity differs")
+	}
+	names := make([]string, len(loaded.Parameters))
+	shapes := make([][]int64, len(loaded.Parameters))
+	for i, parameter := range loaded.Parameters {
+		info, err := parameter.Value.Info()
+		if err != nil || len(info.Shape) != 2 {
+			return errors.New("model parameter metadata differs")
+		}
+		names[i], shapes[i] = parameter.Name, info.Shape
+	}
+	adapter, err := readFrozenTensorFile(ctx, filepath.Join(previous, "adapter_model.safetensors"), prior.AdapterFileSHA, names, shapes)
+	if err != nil {
+		return err
+	}
+	momentNames, momentShapes := make([]string, 0, 2*len(names)), make([][]int64, 0, 2*len(names))
+	for i, name := range names {
+		momentNames = append(momentNames, "m."+name, "v."+name)
+		momentShapes = append(momentShapes, shapes[i], shapes[i])
+	}
+	moments, err := readFrozenTensorFile(ctx, filepath.Join(previous, "optimizer_moments.safetensors"), prior.OptimizerFileSHA, momentNames, momentShapes)
+	if err != nil {
+		return err
+	}
+	state := optim.AdamWState{Step: prior.Step}
+	for i := range names {
+		state.Parameters = append(state.Parameters, adapter[i]...)
+		state.First = append(state.First, moments[2*i]...)
+		state.Second = append(state.Second, moments[2*i+1]...)
+	}
+	if err := optim.ValidateAdamWState(state); err != nil {
+		return err
+	}
+	digest, err := loaded.ReplaceParameters(ctx, state.Parameters)
+	if err != nil || digest != prior.UpdatedAdapterSHA {
+		return errors.New("previous adapter identity differs")
+	}
+	fmt.Printf("phase=resumed step=%d adapter_sha256=%s example=%s\n", prior.Step, digest, row.ID)
+	memory("resumed")
+	if output == "" {
+		observed, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+		if err != nil || observed != prior.LogitsAfterSHA {
+			return errors.Join(errors.New("reloaded checkpoint inference differs"), err)
+		}
+		fmt.Printf("phase=checkpoint_reload_verified step=%d logits_sha256=%s elapsed=%s\n", prior.Step, observed, time.Since(started))
+		return nil
+	}
+	tokens := int64(len(row.InputIDs))
+	gradient, err := ornith.CompletionGradient(ctx, loaded.Model, row.InputIDs, row.PromptTokens,
+		ornith.Limits{MaxTokens: tokens, LogitRows: tokens - int64(row.PromptTokens) + 1, MaxCheckpointBytes: tokens * 4096 * 68}, 1)
+	if err != nil || gradient.Tokens != len(row.InputIDs)-row.PromptTokens || len(gradient.Gradients) != len(names) {
+		return errors.Join(errors.New("resumed completion gradient incomplete"), err)
+	}
+	memory("gradient")
+	flat := make([]float32, 0, len(state.Parameters))
+	for i, item := range gradient.Gradients {
+		if item.Name != names[i] || len(item.ValuesF32) != len(adapter[i]) {
+			return errors.New("resumed gradient geometry differs")
+		}
+		flat = append(flat, item.ValuesF32...)
+	}
+	config := optim.AdamWConfig{LearningRate: 2e-6, Beta1: .9, Beta2: .999, Epsilon: 1e-8, WeightDecay: 0, MaxGradientNorm: 1}
+	next, receipt, err := optim.UpdateAdamW(state, flat, config)
+	if err != nil {
+		return err
+	}
+	nextDigest, err := loaded.ReplaceParameters(ctx, next.Parameters)
+	if err != nil || nextDigest == digest {
+		return errors.Join(errors.New("resumed update did not install"), err)
+	}
+	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+	if err != nil {
+		return err
+	}
+	memory("updated_inference")
+	parent := filepath.Dir(output)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(output); err == nil {
+		return errors.New("next checkpoint already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	temporary, err := os.MkdirTemp(parent, ".arasa-step-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporary)
+	newAdapter := make([]checkpoint.Float32Tensor, 0, len(names))
+	newMoments := make([]checkpoint.Float32Tensor, 0, len(momentNames))
+	position := 0
+	for i, name := range names {
+		count := len(adapter[i])
+		shape := []uint64{uint64(shapes[i][0]), uint64(shapes[i][1])}
+		newAdapter = append(newAdapter, checkpoint.Float32Tensor{Name: name, Shape: shape, Values: next.Parameters[position : position+count]})
+		newMoments = append(newMoments, checkpoint.Float32Tensor{Name: "m." + name, Shape: shape, Values: next.First[position : position+count]}, checkpoint.Float32Tensor{Name: "v." + name, Shape: shape, Values: next.Second[position : position+count]})
+		position += count
+	}
+	adapterReceipt, err := writeAndReadback(ctx, filepath.Join(temporary, "adapter_model.safetensors"), newAdapter)
+	if err != nil {
+		return err
+	}
+	momentsReceipt, err := writeAndReadback(ctx, filepath.Join(temporary, "optimizer_moments.safetensors"), newMoments)
+	if err != nil {
+		return err
+	}
+	manifest := stepManifest{Step: next.Step, ExampleID: row.ID, SupervisedTokens: gradient.Tokens, LossBefore: gradient.Loss,
+		UpdatedAdapterSHA: nextDigest, AdapterFileSHA: adapterReceipt.SHA256, OptimizerFileSHA: momentsReceipt.SHA256,
+		LogitsAfterSHA: after, BaseRevision: prior.BaseRevision}
+	body, err = json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(temporary, "manifest.json"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(append(body, '\n')); err != nil {
+		file.Close()
+		return err
+	}
+	if err := errors.Join(file.Sync(), file.Close()); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, output); err != nil {
+		return err
+	}
+	directory, err := os.Open(parent)
+	if err == nil {
+		err = errors.Join(directory.Sync(), directory.Close())
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("phase=step_verified step=%d loss=%g tokens=%d changed=%d elapsed=%s checkpoint=%s\n", receipt.Step, gradient.Loss, gradient.Tokens, receipt.ChangedParameter, time.Since(started), output)
+	return nil
+}
