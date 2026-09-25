@@ -70,7 +70,41 @@ boundaries, verify causal attention with LoRA and partial rotation, and check
 ownership, cancellation, invalid inputs and error paths. CPU fixtures are not
 model training, fleet execution, GPU admission or benchmark evidence.
 
-## Remaining before model training
+## Local Apple Metal qualification (2026-09-25)
+
+The optional bridge now admits the unindexed MPS device. The frozen CUDA
+reference is still validated before `PlanLocalMPSAssembly` explicitly places
+its 459 tensors on one MPS device. The plan requires a caller-supplied aggregate
+payload cap; this is not a measured process-memory limit. CPU/CUDA placement and
+the frozen two-GPU path remain available.
+
+On an M4 Max with 36 GiB unified memory, the official macOS arm64 LibTorch
+2.14.0 archive (SHA-256
+`2985d3e27e7c8509e17862a0aac140556f944e22a7a53bea7d753d3acc3236ce`)
+passed the full tagged suite, including a 32-layer small-model causal loss/VJP
+comparison with CPU. The four source Safetensors shards at Ornith revision
+`489cb97981b8654bcfcf30ce1f94ed1b62e07b53` matched their pinned hashes.
+The full 9B text assembly loaded and verified all 459 reference tensors in
+24.25 seconds. One admitted Arandu completion (743 input tokens, 74 supervised)
+produced loss 3.635525942 and 32 finite LoRA gradients, 294912 nonzero. A
+separately identified local batch-one AdamW step changed 294912 parameters;
+the adapter and moments were saved as Safetensors. A fresh process reloaded the
+adapter and reproduced the post-update logits hash. Evidence lives under
+`runtime/arasa-local-train-20260925/` in the parent project.
+
+This establishes one local update and adapted text inference. It does not
+establish a completed SFT curriculum, teacher fusion, Recovery/Protection,
+quantized variants, quality gains, or a safe memory peak for long contexts.
+The local batch-one numerical mode is distinct from the frozen distributed
+20-rank optimizer protocol.
+
+## Remaining before full model training and promotion
+
+The local-first path needs durable multi-example optimizer/resume state,
+admission of longer contexts without silent truncation, measured Metal memory
+limits, the full admitted SFT curriculum, teacher caches, Recovery/Protection
+and independent quality gates before Master or quantized variants are claimed.
+The following Linux/SM75 work is the separate historical distributed path:
 
 1. Qualify forward and backward on the frozen calibration inputs, including
    numeric casts and the admitted loss/optimizer trajectory.

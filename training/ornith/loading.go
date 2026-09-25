@@ -66,6 +66,7 @@ type AssemblySummary struct {
 	BaseTensors, AdapterTensors int
 	AdapterElements             int64
 	PersistentBytes             [2]int64
+	LocalMPSBytes               int64
 	Identity                    AssemblyIdentity
 }
 
@@ -76,6 +77,7 @@ type AssemblyPlan struct {
 	weights, adapters []AssemblyTensor
 	limits            AssemblyLimits
 	summary           AssemblySummary
+	localMPS          bool
 }
 
 // Summary returns value-only counts, budgets and document identities.
@@ -257,6 +259,30 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 	return p, nil
 }
 
+// PlanLocalMPSAssembly retains the frozen two-CUDA reference validation and
+// content hashes, then explicitly places the same tensors on one Apple device.
+// maxMPSBytes is a caller-admitted payload cap, not an available-memory probe;
+// activations, allocator overhead and system reserve need separate admission.
+func PlanLocalMPSAssembly(indexJSON, configJSON, referenceJSON []byte, identity AssemblyIdentity, limits AssemblyLimits, maxMPSBytes int64) (*AssemblyPlan, error) {
+	p, err := PlanTextAssembly(indexJSON, configJSON, referenceJSON, identity, limits)
+	if err != nil {
+		return nil, err
+	}
+	needed := p.summary.PersistentBytes[0] + p.summary.PersistentBytes[1]
+	if maxMPSBytes <= 0 || needed > maxMPSBytes {
+		return nil, fmt.Errorf("%w: local MPS persistent budget needs %d bytes", ErrAssembly, needed)
+	}
+	for i := range p.weights {
+		p.weights[i].Device = torch.MPSDevice()
+	}
+	for i := range p.adapters {
+		p.adapters[i].Device = torch.MPSDevice()
+	}
+	p.summary.LocalMPSBytes = needed
+	p.localMPS = true
+	return p, nil
+}
+
 // InspectAssemblySources opens only required shards, validates headers and all
 // source shapes/dtypes/copy admissions, then closes every source. No payload or
 // native tensor is read/created. Successful inspection is not a content attestation.
@@ -265,11 +291,11 @@ func InspectAssemblySources(ctx context.Context, plan *AssemblyPlan, provider Sh
 	return result, errors.Join(err, closeAssemblySources(sources))
 }
 
-// LoadTextAssembly assembles the fixed two-GPU text model from caller-owned
+// LoadTextAssembly assembles the fixed text model from caller-owned
 // immutable shard providers and an exact borrowed CPU initializer. It verifies
 // all source headers before payloads, then every final tensor hash after the
 // historical Float16 intermediate and Float32 attention promotion. A mismatch
-// closes all placed tensors; no partial model is returned. CUDA resource caps,
+// closes all placed tensors; no partial model is returned. GPU resource caps,
 // process deadlines and live reserve monitoring remain caller responsibilities.
 // Initial tensors must remain open and unchanged until this operation returns.
 func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardProvider, initial *InitialAdapter) (_ *LoadedTextModel, err error) {
@@ -279,15 +305,28 @@ func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardPro
 	if err := validateAssemblyInitial(ctx, plan, initial); err != nil {
 		return nil, err
 	}
-	if !torch.CUDAEnabled() {
-		return nil, torch.ErrCUDAUnavailable
-	}
-	count, err := torch.CUDADeviceCount()
-	if err != nil {
-		return nil, err
-	}
-	if count != 2 {
-		return nil, fmt.Errorf("%w: exactly two visible CUDA devices required", ErrAssembly)
+	if plan.localMPS {
+		if !torch.MPSAvailable() {
+			return nil, fmt.Errorf("%w: local MPS unavailable", ErrAssembly)
+		}
+		probe, probeErr := torch.FromFloat32([]float32{0}, []int64{1}, torch.MPSDevice(), false)
+		if probeErr != nil {
+			return nil, fmt.Errorf("%w: local MPS unavailable: %v", ErrAssembly, probeErr)
+		}
+		if closeErr := probe.Close(); closeErr != nil {
+			return nil, closeErr
+		}
+	} else {
+		if !torch.CUDAEnabled() {
+			return nil, torch.ErrCUDAUnavailable
+		}
+		count, countErr := torch.CUDADeviceCount()
+		if countErr != nil {
+			return nil, countErr
+		}
+		if count != 2 {
+			return nil, fmt.Errorf("%w: exactly two visible CUDA devices required", ErrAssembly)
+		}
 	}
 	sources, _, err := openAssemblySources(ctx, plan, provider)
 	if err != nil {
@@ -361,7 +400,7 @@ func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardPro
 		result.Parameters = append(result.Parameters, InitialParameter{Name: spec.ReferenceName, Value: leaf})
 		result.Receipts = append(result.Receipts, AssemblyTensorReceipt{Name: spec.ReferenceName, SHA256: spec.SHA256})
 	}
-	wireAssembly(result.Model, values, plan.limits)
+	wireAssembly(result.Model, values, plan.limits, plan.localMPS)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -688,7 +727,7 @@ func verifyAssemblyTensor(ctx context.Context, value *torch.Tensor, spec Assembl
 	return ctx.Err()
 }
 
-func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits AssemblyLimits) {
+func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits AssemblyLimits, localMPS bool) {
 	get := func(source string) *torch.Tensor { return values["base_model.model."+source] }
 	model.Embedding = get("model.language_model.embed_tokens.weight")
 	model.FinalNorm = get("model.language_model.norm.weight")
@@ -698,6 +737,9 @@ func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits Asse
 		g := func(s string) *torch.Tensor { return get(prefix + s) }
 		layer := &model.Layers[i]
 		layer.Device = torch.CUDADevice(i / 16)
+		if localMPS {
+			layer.Device = torch.MPSDevice()
+		}
 		layer.Config = layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: limits.MaxInputElements,
 			Full:   layers.AttentionConfig{Heads: 16, KVHeads: 4, HeadDimension: 256, RotaryDimension: 64, Epsilon: 1e-6, MaxScoreElements: limits.MaxScoreElements},
 			Linear: layers.LinearAttentionConfig{KeyHeads: 16, ValueHeads: 32, KeyDimension: 128, ValueDimension: 128, Epsilon: 1e-6, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence}}

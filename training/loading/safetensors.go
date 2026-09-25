@@ -37,7 +37,7 @@ type Expectation struct {
 // This accounts conservatively for the Go payload, native CPU copy and converted
 // destination. Header parsing, allocator overhead, transfer workspaces and other
 // live tensors are separate caller-owned budgets; this is not a total RSS cap.
-// CUDA selection does not establish permission or qualify GPU memory capacity.
+// Device selection does not establish permission or qualify GPU memory capacity.
 type Options struct {
 	HeaderLimits checkpoint.Limits
 	BudgetBytes  int64
@@ -215,8 +215,9 @@ func validateOptions(options Options) error {
 	if _, err := dtypeBytes(options.DType); err != nil {
 		return err
 	}
-	if options.Device != torch.CPUDevice() && (options.Device.Kind != "cuda" || options.Device.Index < 0 || options.Device.Index > 127) {
-		return errors.New("loading: explicit CPU or indexed CUDA device is required")
+	if options.Device != torch.CPUDevice() && options.Device != torch.MPSDevice() &&
+		(options.Device.Kind != "cuda" || options.Device.Index < 0 || options.Device.Index > 127) {
+		return errors.New("loading: explicit CPU, MPS, or indexed CUDA device is required")
 	}
 	if options.RequiresGrad && (options.DType == torch.Int64 || options.DType == torch.Bool) {
 		return errors.New("loading: integer and boolean destination tensors cannot require gradients")

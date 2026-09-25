@@ -60,16 +60,24 @@ func read(t *testing.T, value *torch.Tensor) []float32 {
 }
 
 func newFixture(t *testing.T, storage torch.DType) *fixture {
+	return newFixtureOnDevice(t, storage, torch.CPUDevice())
+}
+
+func newFixtureOnDevice(t *testing.T, storage torch.DType, device torch.Device) *fixture {
 	t.Helper()
 	f := &fixture{tokens: []int64{1, 4, 2}, limits: ornith.Limits{MaxTokens: 3, LogitRows: 2, MaxCheckpointBytes: 1632}, seed: values(12, 0.3, 0.7)}
+	fixtureTensor := func(data []float32, shape []int64, grad bool) *torch.Tensor {
+		value, err := torch.FromFloat32(data, shape, device, grad)
+		return own(t, value, err)
+	}
 	base := func(shape []int64, phase, scale float64, stored bool) *torch.Tensor {
 		size := 1
 		for _, dim := range shape {
 			size *= int(dim)
 		}
-		value := tensor(t, values(size, phase, scale), shape, false)
+		value := fixtureTensor(values(size, phase, scale), shape, false)
 		if stored && storage != torch.Float32 {
-			converted, err := value.To(torch.CPUDevice(), storage)
+			converted, err := value.To(device, storage)
 			value = own(t, converted, err)
 		}
 		f.base = append(f.base, value)
@@ -95,7 +103,7 @@ func newFixture(t *testing.T, storage torch.DType) *fixture {
 	for i := range cos {
 		cos[i], sin[i] = float32(math.Cos(float64(i)*0.3)), float32(math.Sin(float64(i)*0.3))
 	}
-	cosine, sine := tensor(t, cos, []int64{3, 1}, false), tensor(t, sin, []int64{3, 1}, false)
+	cosine, sine := fixtureTensor(cos, []int64{3, 1}, false), fixtureTensor(sin, []int64{3, 1}, false)
 	f.base = append(f.base, cosine, sine)
 	f.model = &ornith.TextModel{
 		Embedding: base([]int64{6, 4}, 0.2, 0.4, true), FinalNorm: base([]int64{4}, 0.3, 0.02, true), Head: base([]int64{6, 4}, 0.7, 0.3, true),
@@ -108,16 +116,16 @@ func newFixture(t *testing.T, storage torch.DType) *fixture {
 			Sequence: sequence.SequenceLimits{ChunkTokens: 2, MaxTokens: 3, MaxOwnedElements: 1 << 20}},
 	}
 	for index := range f.model.Layers {
-		layer := ornith.Layer{Weights: shared, Config: config, Device: torch.CPUDevice()}
+		layer := ornith.Layer{Weights: shared, Config: config, Device: device}
 		if index%4 == 3 {
 			layer.Weights.Full = full
 			layer.Cosine, layer.Sine = cosine, sine
 			phase := float64(index) * 0.13
 			layer.Adapter = &layers.AttentionLoRA{
-				QueryA: tensor(t, values(16, phase+0.2, 0.1), []int64{4, 4}, true),
-				QueryB: tensor(t, values(32, phase+0.4, 0.1), []int64{8, 4}, true),
-				ValueA: tensor(t, values(16, phase+0.6, 0.1), []int64{4, 4}, true),
-				ValueB: tensor(t, values(8, phase+0.8, 0.1), []int64{2, 4}, true), Alpha: 8,
+				QueryA: fixtureTensor(values(16, phase+0.2, 0.1), []int64{4, 4}, true),
+				QueryB: fixtureTensor(values(32, phase+0.4, 0.1), []int64{8, 4}, true),
+				ValueA: fixtureTensor(values(16, phase+0.6, 0.1), []int64{4, 4}, true),
+				ValueB: fixtureTensor(values(8, phase+0.8, 0.1), []int64{2, 4}, true), Alpha: 8,
 			}
 		} else {
 			layer.Weights.Linear = linear

@@ -21,6 +21,8 @@ const nativeEnabled = true
 
 func nativeVersion() (string, error) { return C.GoString(C.tayi_torch_header_version()), nil }
 
+func nativeMPSAvailable() bool { return C.tayi_torch_mps_available() != 0 }
+
 func resultValue(result C.tayi_torch_result) (unsafe.Pointer, error) {
 	if result.tensor == nil {
 		return nil, fmt.Errorf("torch: %s", C.GoString(&result.error[0]))
@@ -58,6 +60,8 @@ func nativeInfo(handle unsafe.Pointer) (Info, error) {
 	}
 	if info.device >= 0 {
 		result.Device = CUDADevice(int(info.device))
+	} else if info.device == -2 {
+		result.Device = MPSDevice()
 	}
 	return result, nil
 }

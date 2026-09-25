@@ -7,6 +7,7 @@ import "unsafe"
 const nativeEnabled = false
 
 func nativeVersion() (string, error) { return "", ErrUnavailable }
+func nativeMPSAvailable() bool       { return false }
 func nativeCreate(unsafe.Pointer, int64, any, []int64, DType, Device, bool) (unsafe.Pointer, error) {
 	return nil, ErrUnavailable
 }

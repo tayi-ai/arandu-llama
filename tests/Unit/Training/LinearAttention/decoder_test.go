@@ -13,6 +13,7 @@ import (
 )
 
 func TestFP16DecoderNormalizesAttentionBeforeStorageRounding(t *testing.T) {
+	keep := func(value *torch.Tensor, err error) *torch.Tensor { return own(t, value, err) }
 	f := newFixture()
 	for row := 0; row < f.batch*f.tokens; row++ {
 		copy(f.x[row*f.hidden:(row+1)*f.hidden], []float32{1, 0, 0})
@@ -28,7 +29,7 @@ func TestFP16DecoderNormalizesAttentionBeforeStorageRounding(t *testing.T) {
 	_, attention := f.tensors(t, false)
 	half := func(values []float32, shape []int64, requiresGrad bool) *torch.Tensor {
 		base := tensor(t, values, shape, requiresGrad)
-		return own(t, base.To(torch.CPUDevice(), torch.Float16))
+		return keep(base.To(torch.CPUDevice(), torch.Float16))
 	}
 	d := int64(f.hidden)
 	x := half(f.x, []int64{int64(f.batch), int64(f.tokens), d}, true)
@@ -41,8 +42,8 @@ func TestFP16DecoderNormalizesAttentionBeforeStorageRounding(t *testing.T) {
 		Down:              half(data(f.hidden*5, 0.5, 0.04), []int64{d, 5}, false),
 		Linear:            &attention,
 	}
-	x32 := own(t, x.To(torch.CPUDevice(), torch.Float32))
-	normalized := own(t, layers.RMSNorm(x32, inputNorm, 1e-4))
+	x32 := keep(x.To(torch.CPUDevice(), torch.Float32))
+	normalized := keep(layers.RMSNorm(x32, inputNorm, 1e-4))
 	peak := float32(0)
 	for _, value := range read(t, normalized) {
 		peak = max(peak, float32(math.Abs(float64(value))))
@@ -51,7 +52,7 @@ func TestFP16DecoderNormalizesAttentionBeforeStorageRounding(t *testing.T) {
 		t.Fatalf("test did not exceed Float16 range: %g", peak)
 	}
 	config := layers.DecoderConfig{Epsilon: 1e-4, MaxInputElements: int64(len(f.x)), Linear: f.config}
-	output := own(t, layers.DecoderForward(context.Background(), x, weights, nil, nil, nil, config))
+	output := keep(layers.DecoderForward(context.Background(), x, weights, nil, nil, nil, config))
 	finite, err := output.AllFinite()
 	if err != nil || !finite {
 		t.Fatalf("attention normalization rounded through Float16: %v", err)

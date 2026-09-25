@@ -36,7 +36,7 @@ const (
 	Bool
 )
 
-// Device identifies CPU or one explicitly indexed CUDA device.
+// Device identifies CPU, Apple Metal, or one explicitly indexed CUDA device.
 type Device struct {
 	Kind  string
 	Index int
@@ -47,6 +47,9 @@ func CPUDevice() Device { return Device{Kind: "cpu"} }
 
 // CUDADevice selects an indexed CUDA device; constructors validate the index.
 func CUDADevice(index int) Device { return Device{Kind: "cuda", Index: index} }
+
+// MPSDevice selects the single Apple Metal device.
+func MPSDevice() Device { return Device{Kind: "mps"} }
 
 // Info describes a tensor without copying its values to the host.
 type Info struct {
@@ -71,6 +74,9 @@ var calls sync.Mutex
 
 // Enabled reports build availability, not numerical or GPU qualification.
 func Enabled() bool { return nativeEnabled }
+
+// MPSAvailable reports whether this LibTorch process can use Apple Metal.
+func MPSAvailable() bool { return nativeMPSAvailable() }
 
 // HeaderVersion returns the LibTorch version against which this bridge compiled.
 // It does not verify the identity of dynamically loaded libraries.
@@ -155,10 +161,13 @@ func deviceIndex(device Device) (int, error) {
 	if device.Kind == "cpu" && device.Index == 0 {
 		return -1, nil
 	}
+	if device.Kind == "mps" && device.Index == 0 {
+		return -2, nil
+	}
 	if device.Kind == "cuda" && device.Index >= 0 && device.Index <= 127 {
 		return device.Index, nil
 	}
-	return 0, errors.New("torch: expected cpu or cuda with an index from 0 to 127")
+	return 0, errors.New("torch: expected cpu, mps, or cuda with an index from 0 to 127")
 }
 
 func wrap(handle unsafe.Pointer, err error) (*Tensor, error) {

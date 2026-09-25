@@ -2,6 +2,9 @@
 
 #include "bridge.h"
 #include <torch/torch.h>
+#ifdef __APPLE__
+#include <torch/mps.h>
+#endif
 #include <torch/version.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <c10/core/DeviceGuard.h>
@@ -14,6 +17,14 @@
 
 struct tayi_torch_tensor { torch::Tensor value; };
 struct tayi_torch_generator { at::Generator value; };
+
+extern "C" int tayi_torch_mps_available(void) {
+#ifdef __APPLE__
+    return torch::mps::is_available() ? 1 : 0;
+#else
+    return 0;
+#endif
+}
 
 namespace {
 void error_text(char *output, size_t capacity, const char *message) noexcept {
@@ -57,6 +68,7 @@ int dtype_code(torch::ScalarType dtype) {
 
 torch::Device device_type(int device) {
     if (device == -1) return torch::Device(torch::kCPU);
+    if (device == -2) return torch::Device(torch::kMPS);
     if (device < 0 || device > 127) throw std::invalid_argument("invalid device index");
     return torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device));
 }
@@ -251,14 +263,14 @@ extern "C" int tayi_torch_metadata(tayi_torch_tensor *handle, tayi_torch_info *i
         if (!info) throw std::invalid_argument("null metadata destination");
         const auto &value = tensor(handle);
         if (value.dim() > 32) throw std::invalid_argument("rank exceeds 32");
-        if (!value.device().is_cpu() && !value.device().is_cuda())
+        if (!value.device().is_cpu() && !value.device().is_cuda() && !value.device().is_mps())
             throw std::invalid_argument("unsupported result device");
         *info = {};
         info->rank = static_cast<int>(value.dim());
         for (int i = 0; i < info->rank; ++i) info->shape[i] = value.size(i);
         info->elements = value.numel();
         info->dtype = dtype_code(value.scalar_type());
-        info->device = value.device().is_cpu() ? -1 : value.device().index();
+        info->device = value.device().is_cpu() ? -1 : value.device().is_mps() ? -2 : value.device().index();
         info->requires_grad = value.requires_grad() ? 1 : 0;
     });
 }

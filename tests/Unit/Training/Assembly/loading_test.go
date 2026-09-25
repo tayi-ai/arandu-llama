@@ -138,6 +138,33 @@ func plan(t *testing.T, d documents) *ornith.AssemblyPlan {
 	return p
 }
 
+func TestLocalMPSAssemblyPreservesFrozenReferenceAndRequiresAggregateBudget(t *testing.T) {
+	i, c, r, id := fixture().encode(t)
+	limits := admittedLimits()
+	needed := limits.PersistentBytes[0] + limits.PersistentBytes[1]
+	if p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed-1); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+		t.Fatalf("under-budget MPS plan accepted: %v", err)
+	}
+	p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Summary().LocalMPSBytes != needed || p.Summary().PersistentBytes != limits.PersistentBytes {
+		t.Fatalf("local placement budget or frozen reference changed: %+v", p.Summary())
+	}
+	for _, item := range p.Tensors() {
+		if item.Device != torch.MPSDevice() {
+			t.Fatalf("tensor %s not on MPS", item.ReferenceName)
+		}
+	}
+	badReference := fixture()
+	badReference.Reference[0].Device = "mps"
+	i, c, r, id = badReference.encode(t)
+	if p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+		t.Fatalf("modified frozen reference accepted: %v", err)
+	}
+}
+
 func TestFixedTextAssemblyPlanAndOwnedMetadata(t *testing.T) {
 	p := plan(t, fixture())
 	summary := p.Summary()
