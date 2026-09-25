@@ -103,11 +103,19 @@ validated, resumable FP32 parameters and moments. A second real Arandu example
 resumed from the first checkpoint and saved a second checkpoint: loss
 3.006498074 over 69 supervised tokens and 557053 changed parameters. A fresh
 process verified the saved adapter and reproduced its logits digest exactly.
+Three more 1024-token-bounded Arandu examples resumed the same optimizer to
+step five. Atomic adapter and moments checkpoints exist for each step. A fresh
+process reloaded step five and reproduced its logits digest. This is five of
+103 examples used for qualification, not a complete SFT curriculum. A LibTorch
+MPS allocator sample after reload reported 22,110,151,168 tensor bytes and
+22,423,224,320 driver bytes against a 30,150,672,384-byte recommended working
+set. This instantaneous sample is not a peak or a full process-memory budget.
 The parent project's evidence is `runtime/arasa-local-train-20260925/`.
 
 ## Remaining before full model training and promotion
 
-The local-first path needs durable multi-example optimizer/resume state,
+The local-first path needs integration of the qualified resume state into an
+Arandu Controller Job, plus
 admission of longer contexts without silent truncation, measured Metal memory
 limits, the full admitted SFT curriculum, teacher caches, Recovery/Protection
 and independent quality gates before Master or quantized variants are claimed.

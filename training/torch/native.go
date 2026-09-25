@@ -23,6 +23,15 @@ func nativeVersion() (string, error) { return C.GoString(C.tayi_torch_header_ver
 
 func nativeMPSAvailable() bool { return C.tayi_torch_mps_available() != 0 }
 
+func nativeMPSMemory() (MPSMemoryStats, error) {
+	var current, driver, recommended C.uint64_t
+	var message [2048]C.char
+	if C.tayi_torch_mps_memory(&current, &driver, &recommended, &message[0], C.size_t(len(message))) != 0 {
+		return MPSMemoryStats{}, fmt.Errorf("torch: %s", C.GoString(&message[0]))
+	}
+	return MPSMemoryStats{CurrentAllocatedBytes: uint64(current), DriverAllocatedBytes: uint64(driver), RecommendedMaxBytes: uint64(recommended)}, nil
+}
+
 func resultValue(result C.tayi_torch_result) (unsafe.Pointer, error) {
 	if result.tensor == nil {
 		return nil, fmt.Errorf("torch: %s", C.GoString(&result.error[0]))

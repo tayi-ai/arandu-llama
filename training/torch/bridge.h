@@ -41,6 +41,8 @@ int tayi_torch_grad(tayi_torch_tensor *const *outputs, size_t output_count,
 int tayi_torch_close(tayi_torch_tensor *tensor, char *error, size_t capacity);
 const char *tayi_torch_header_version(void);
 int tayi_torch_mps_available(void);
+int tayi_torch_mps_memory(uint64_t *current, uint64_t *driver, uint64_t *recommended,
+    char *error, size_t capacity);
 tayi_torch_generator_result tayi_torch_generator_create(uint64_t seed);
 tayi_torch_result tayi_torch_generator_uniform(tayi_torch_generator *generator,
     const int64_t *shape, size_t rank, double low, double high, int dtype);

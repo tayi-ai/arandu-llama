@@ -4,6 +4,7 @@
 #include <torch/torch.h>
 #ifdef __APPLE__
 #include <torch/mps.h>
+#include <ATen/detail/MPSHooksInterface.h>
 #endif
 #include <torch/version.h>
 #include <ATen/CPUGeneratorImpl.h>
@@ -104,6 +105,22 @@ std::vector<torch::Tensor> tensor_list(tayi_torch_tensor *const *handles, size_t
     for (size_t i = 0; i < count; ++i) result.push_back(tensor(handles[i]));
     return result;
 }
+}
+
+extern "C" int tayi_torch_mps_memory(uint64_t *current, uint64_t *driver,
+    uint64_t *recommended, char *error, size_t capacity) {
+    return checked(error, capacity, [&] {
+        if (!current || !driver || !recommended) throw std::invalid_argument("MPS memory outputs required");
+#ifdef __APPLE__
+        if (!torch::mps::is_available()) throw std::runtime_error("MPS unavailable");
+        const auto &hooks = at::detail::getMPSHooks();
+        *current = hooks.getCurrentAllocatedMemory();
+        *driver = hooks.getDriverAllocatedMemory();
+        *recommended = hooks.getRecommendedMaxMemory();
+#else
+        throw std::runtime_error("MPS memory is unavailable on this platform");
+#endif
+    });
 }
 
 extern "C" tayi_torch_generator_result tayi_torch_generator_create(uint64_t seed) {

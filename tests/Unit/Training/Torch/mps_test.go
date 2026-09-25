@@ -53,3 +53,16 @@ func TestMPSMatMulAutogradAndRoundTrip(t *testing.T) {
 		t.Fatal("indexed MPS device was accepted")
 	}
 }
+
+func TestMPSMemoryTelemetry(t *testing.T) {
+	if !torch.MPSAvailable() {
+		t.Skip("MPS device is unavailable")
+	}
+	stats, err := torch.ReadMPSMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.RecommendedMaxBytes == 0 || stats.DriverAllocatedBytes < stats.CurrentAllocatedBytes {
+		t.Fatalf("invalid MPS allocator reading: %+v", stats)
+	}
+}
