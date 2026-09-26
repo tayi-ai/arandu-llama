@@ -10,10 +10,9 @@ framework = ">= 0.46"
 profiles = ["conventional", "performance"]
 
 [permissions]
-# It answers requests and reads its own rows. Nothing leaves the process: the
-# engine that holds the weights is passed in, and reaching it is the caller's
-# capability rather than this package's.
-network = false
+# Configured scoring clients and collective transports reach explicitly supplied
+# endpoints. Importing the package never opens a connection or reads credentials.
+network = true
 # It reads model files, adapter files and their digests from disk. That is what
 # an inference engine is, and the audit caught this declaration saying otherwise:
 # the wrapper this package replaced held no weights and could say false, and this
