@@ -281,7 +281,7 @@ func TestExperimentDecoder16CapturedReplay(t *testing.T) {
 	}
 	plan, e := decoder.PlanTextAssembly(read("model.safetensors.index.json"), read("config.json"), read("initial-reference.json"), decoder.AssemblyIdentity{IndexSHA256: manifest.Files["model.safetensors.index.json"], ConfigSHA256: manifest.Files["config.json"], ReferenceSHA256: manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, limits)
 	check(e)
-	f, e := os.Open("/cache/tayi/checkpoints/fixture/model-00003-of-00004.safetensors")
+	f, e := os.Open(filepath.Join(experiment.config.BasePath, "model-00003-of-00004.safetensors"))
 	check(e)
 	defer f.Close()
 	stat, e := f.Stat()
@@ -319,7 +319,7 @@ func TestExperimentDecoder16CapturedReplay(t *testing.T) {
 				check(e)
 				owned = append(owned, placed)
 				spec.Device = device
-				digest, e := ExperimentNativeTensorDigest(ctx, placed, spec, 4<<20)
+				digest, e := ExperimentNativeTensorDigest(ctx, placed, spec, limits.HashChunkBytes)
 				check(e)
 				if digest != spec.SHA256 {
 					t.Fatal("frozen weight differs", spec.SourceName)
