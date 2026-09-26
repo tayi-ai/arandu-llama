@@ -91,7 +91,7 @@ func TestConfigSnapshotOwnsNestedSlicesAndAdmissions(t *testing.T) {
 	c.Recipe.Assembly.PersistentBytes = []int64{1024}
 	c.Recipe.Assembly.DeviceByLayer = []int{0}
 	c.Recipe.Initializer.Projections = []decoder.InitialProjection{{Name: "synthetic", Input: 2, Output: 2, Rank: 1}}
-	owned, err := c.snapshot()
+	owned, err := c.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,5 +101,32 @@ func TestConfigSnapshotOwnsNestedSlicesAndAdmissions(t *testing.T) {
 	c.Recipe.Initializer.Projections[0].Name = "changed"
 	if owned.AdmittedCheckpoints[1] == "" || owned.Recipe.Assembly.PersistentBytes[0] != 1024 || owned.Recipe.Assembly.DeviceByLayer[0] != 0 || owned.Recipe.Initializer.Projections[0].Name != "synthetic" {
 		t.Fatal("configuration snapshot aliases caller state")
+	}
+}
+
+func TestPublicConfigSnapshotAppliesExecutionValidation(t *testing.T) {
+	base := checkpointFixture(t)
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"relative path", func(c *Config) { c.ModelDir = "relative" }},
+		{"token bound", func(c *Config) { c.MaxTokens = 4097 }},
+		{"step bound", func(c *Config) { c.MaxSteps = 21 }},
+		{"method", func(c *Config) { c.Recipe.Method = "unsupported" }},
+		{"identity", func(c *Config) { c.Recipe.Identity.ConfigSHA256 = "invalid" }},
+		{"optimizer", func(c *Config) { c.Recipe.Optimizer.LearningRate = -1 }},
+		{"historical admission", func(c *Config) { c.AdmittedCheckpoints = map[uint64]string{0: strings.Repeat("2", 64)} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base
+			tc.mutate(&c)
+			_, publicErr := c.Snapshot()
+			_, executionErr := c.snapshot()
+			if publicErr == nil || executionErr == nil || publicErr.Error() != executionErr.Error() {
+				t.Fatalf("validation differs: admission=%v execution=%v", publicErr, executionErr)
+			}
+		})
 	}
 }

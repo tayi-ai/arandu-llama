@@ -103,3 +103,11 @@ func (c Config) snapshot() (Config, error) {
 	}
 	return owned, owned.validate()
 }
+
+// Snapshot returns an owned, validated configuration for queue admission.
+// It performs CPU-only structural validation; it does not read artifacts,
+// initialize a native backend, or qualify a model. Callers must not mutate
+// the input during this call; subsequent changes cannot alter the snapshot.
+func (c Config) Snapshot() (Config, error) {
+	return c.snapshot()
+}
