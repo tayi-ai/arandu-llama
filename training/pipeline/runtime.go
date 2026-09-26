@@ -29,7 +29,11 @@ type Execution struct {
 type Progress struct {
 	StageID        string
 	CompletedSteps int64
-	Checkpoint     string
+	// CompletedStages counts the contiguous prefix with verified completion receipts.
+	// StageSteps is the number of durable steps within StageID, not a completion flag.
+	CompletedStages int
+	StageSteps      int64
+	Checkpoint      string
 }
 
 // Runtime is the versioned module boundary used by both local queue workers and

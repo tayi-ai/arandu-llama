@@ -54,6 +54,7 @@ type Recipe struct {
 	Student     ArtifactRef   `json:"student"`
 	Teachers    []ArtifactRef `json:"teachers"`
 	Training    ArtifactRef   `json:"training"`
+	Recovery    ArtifactRef   `json:"recovery"`
 	Calibration ArtifactRef   `json:"calibration"`
 	Protection  ArtifactRef   `json:"protection"`
 	Heldout     ArtifactRef   `json:"heldout"`
@@ -66,14 +67,14 @@ func (r Recipe) Validate() error {
 		return errors.New("training recipe: invalid version, method or stage count")
 	}
 	seenArtifacts := map[string]string{}
-	for _, ref := range append([]ArtifactRef{r.Student, r.Training, r.Calibration, r.Protection, r.Heldout}, r.Teachers...) {
+	for _, ref := range append([]ArtifactRef{r.Student, r.Training, r.Recovery, r.Calibration, r.Protection, r.Heldout}, r.Teachers...) {
 		if !identifier(ref.ID) || !digest(ref.SHA256) || seenArtifacts[ref.ID] != "" {
 			return errors.New("training recipe: invalid or repeated artifact identity")
 		}
 		seenArtifacts[ref.ID] = ref.SHA256
 	}
 	dataDigests := map[string]bool{}
-	for _, ref := range []ArtifactRef{r.Training, r.Calibration, r.Protection, r.Heldout} {
+	for _, ref := range []ArtifactRef{r.Training, r.Recovery, r.Calibration, r.Protection, r.Heldout} {
 		if dataDigests[ref.SHA256] {
 			return errors.New("training recipe: data roles share an artifact")
 		}
@@ -101,7 +102,7 @@ func (r Recipe) Validate() error {
 		if inputs[r.Protection.ID] && stage.Phase != PhaseFusion && stage.Phase != PhaseRecovery && stage.Phase != PhaseVariantRecovery && stage.Phase != PhaseMaster {
 			return errors.New("training recipe: protection data cannot feed SFT, teacher cache or alignment")
 		}
-		if stage.Phase == PhaseFusion && !inputs[r.Protection.ID] {
+		if (stage.Phase == PhaseFusion || stage.Phase == PhaseRecovery || stage.Phase == PhaseVariantRecovery) && !inputs[r.Protection.ID] {
 			return errors.New("training recipe: constrained fusion requires protection")
 		}
 		parent := ""
@@ -117,7 +118,7 @@ func (r Recipe) Validate() error {
 		required := r.Training.ID
 		switch stage.Phase {
 		case PhaseRecovery, PhaseVariantRecovery:
-			required = r.Protection.ID
+			required = r.Recovery.ID
 		case PhaseMaster:
 			required = r.Heldout.ID
 		case PhaseCalibration, PhaseQuantize:

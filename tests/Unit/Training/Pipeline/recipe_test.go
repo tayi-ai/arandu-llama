@@ -15,7 +15,7 @@ func ref(id string) pipeline.ArtifactRef {
 	return pipeline.ArtifactRef{ID: id, SHA256: hex.EncodeToString(s[:])}
 }
 func recipe() pipeline.Recipe {
-	r := pipeline.Recipe{Version: 1, ID: "admitted-v1", Method: "generational-fusion-v1", Student: ref("student"), Teachers: []pipeline.ArtifactRef{ref("teacher")}, Training: ref("train"), Calibration: ref("calibration"), Protection: ref("protection"), Heldout: ref("heldout")}
+	r := pipeline.Recipe{Version: 1, ID: "admitted-v1", Method: "generational-fusion-v1", Student: ref("student"), Teachers: []pipeline.ArtifactRef{ref("teacher")}, Training: ref("train"), Recovery: ref("recovery"), Calibration: ref("calibration"), Protection: ref("protection"), Heldout: ref("heldout")}
 	add := func(phase pipeline.Phase, input pipeline.ArtifactRef, format string) {
 		parent := ""
 		if len(r.Stages) > 0 {
@@ -25,7 +25,7 @@ func recipe() pipeline.Recipe {
 			parent = r.Stages[5].ID
 		}
 		inputs := []pipeline.ArtifactRef{input}
-		if phase == pipeline.PhaseFusion {
+		if phase == pipeline.PhaseFusion || phase == pipeline.PhaseRecovery || phase == pipeline.PhaseVariantRecovery {
 			inputs = append(inputs, r.Protection)
 		}
 		r.Stages = append(r.Stages, pipeline.Stage{ID: fmt.Sprintf("stage-%d", len(r.Stages)), Phase: phase, Inputs: inputs, MaxSteps: 1, MaxTokens: 128, TimeoutSeconds: 60, Format: format, ParentStage: parent})
@@ -33,12 +33,12 @@ func recipe() pipeline.Recipe {
 	for _, p := range []pipeline.Phase{pipeline.PhaseSFT, pipeline.PhaseTeacherCache, pipeline.PhaseAlignment, pipeline.PhaseFusion} {
 		add(p, r.Training, "")
 	}
-	add(pipeline.PhaseRecovery, r.Protection, "")
+	add(pipeline.PhaseRecovery, r.Recovery, "")
 	add(pipeline.PhaseMaster, r.Heldout, "")
 	add(pipeline.PhaseCalibration, r.Calibration, "")
 	for _, f := range []string{"Q8_0", "Q6_K", "Q4_K_M"} {
 		add(pipeline.PhaseQuantize, r.Calibration, f)
-		add(pipeline.PhaseVariantRecovery, r.Protection, f)
+		add(pipeline.PhaseVariantRecovery, r.Recovery, f)
 	}
 	return r
 }
