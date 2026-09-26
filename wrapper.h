@@ -339,6 +339,33 @@ int llama_wrapper_capture_lora(void* model, const char* module,
                                const int* tokens, int n_tokens, int n_ctx,
                                llama_wrapper_lora_capture* out);
 
+// Load owned teacher weights without mmap. Zero GPU layers additionally clears
+// the GPU device list, so CPU execution never initializes a GPU backend.
+// Released through llama_wrapper_model_free. Tensor splitting is unsupported.
+void* llama_wrapper_teacher_model_load(const char* path, llama_wrapper_model_params options);
+
+// Inspect the exact feature tensor supported by the pinned teacher graph.
+// result_norm is final normalized hidden state; l_out-N is a decoder output
+// only for the explicitly admitted llama/qwen35 builders. No aliasing of names.
+int llama_wrapper_teacher_geometry(void* model, const char* tensor, int* vocabulary, int* width);
+
+// Capture supplied gold-prefix rows in a fresh, adapter-free causal context.
+// Position p predicts tokens[p+1]; positions must strictly increase in [0,n-2].
+// Every decode-window row is an output row. Features are read from the exact
+// named graph tensor through the native callback; no token is sampled.
+// Probabilities use full-vocabulary softmax at temperature 1, then top-k ordered
+// by descending probability and ascending token ID on ties. Retained mass is
+// the sum of these unrenormalized probabilities. Exact output lengths required.
+// context_tokens must be a positive multiple of 256, the pinned KV alignment.
+// max_window_bytes bounds window logits, features and top-k scratch, excluding weights, KV
+// and decoder workspaces. The caller admits those separately. Returns 0 or -1;
+// errors set llama_wrapper_last_error and invalidate every output buffer.
+int llama_wrapper_capture_teacher(void* model, const char* tensor,
+                                  const int* tokens, int n_tokens, const int* positions, int n_positions,
+                                  int top_k, int context_tokens, int window_tokens, int threads, bool cpu_only,
+                                  long long max_window_bytes, int* out_ids, double* out_probabilities,
+                                  long long top_elements, double* out_mass, float* out_features, long long feature_elements);
+
 #ifdef __cplusplus
 }
 #endif

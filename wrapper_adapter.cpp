@@ -25,8 +25,12 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
+#include <limits>
+#include <memory>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <utility>
@@ -35,10 +39,11 @@
 // The handle layouts wrapper.cpp allocates. They are repeated rather than
 // shared through a header because upstream keeps them private to that
 // translation unit, and adding a header would be a second point of conflict.
-// If either gains a field, the change is caught by the compiler here.
-typedef struct {
+// Keep these layouts in sync with wrapper.cpp when updating the binding.
+struct llama_wrapper_model_t {
     llama_model* model;
-} llama_wrapper_model_t;
+    int n_gpu_layers;
+};
 
 typedef struct {
     llama_context* ctx;
@@ -50,7 +55,288 @@ typedef struct {
 // meaning, whichever file wrote last.
 extern std::string g_last_error;
 
+namespace {
+struct teacher_capture_rows {
+    std::string tensor;
+    std::string failure;
+    const int* positions;
+    int rows;
+    int width;
+    int start = 0;
+    int count = 0;
+    bool seen = false;
+    float* output;
+
+    static bool observe(ggml_tensor* value, bool ask, void* data) {
+        auto& self = *static_cast<teacher_capture_rows*>(data);
+        if (self.tensor != ggml_get_name(value)) return ask ? false : true;
+        if (ask) return true;
+        try {
+            if (self.seen || value->type != GGML_TYPE_F32 ||
+                value->ne[0] != self.width || value->ne[1] != self.count ||
+                value->ne[2] != 1 || value->ne[3] != 1 || !ggml_is_contiguous(value)) {
+                self.failure = "Teacher feature tensor geometry, type or occurrence differs";
+                return false;
+            }
+            self.seen = true;
+            for (int row = 0; row < self.rows; ++row) {
+                const int local = self.positions[row] - self.start;
+                if (local < 0 || local >= self.count) continue;
+                float* destination = self.output + static_cast<size_t>(row) * self.width;
+                ggml_backend_tensor_get(value, destination, static_cast<size_t>(local) * value->nb[1],
+                                        static_cast<size_t>(self.width) * sizeof(float));
+                for (int column = 0; column < self.width; ++column) {
+                    if (!std::isfinite(destination[column])) {
+                        self.failure = "Teacher feature tensor contains nonfinite values";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            self.failure = "Exception reading teacher feature tensor: " + std::string(e.what());
+            return false;
+        }
+    }
+};
+
+struct teacher_batch_guard {
+    llama_batch batch;
+    explicit teacher_batch_guard(int count) : batch(llama_batch_init(count, 0, 1)) {}
+    ~teacher_batch_guard() { llama_batch_free(batch); }
+};
+
+bool teacher_geometry(llama_model* model, const char* tensor, int& vocabulary, int& width) {
+    if (!model || !tensor) {
+        g_last_error = "Teacher model and exact tensor name are required";
+        return false;
+    }
+    const std::string name(tensor);
+    if (name == "result_norm") {
+        width = llama_model_n_embd_out(model);
+    } else if (name.compare(0, 6, "l_out-") == 0) {
+        char architecture[64] = {};
+        const int length = llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+        if (length <= 0 || (std::strcmp(architecture, "llama") != 0 && std::strcmp(architecture, "qwen35") != 0)) {
+            g_last_error = "Decoder feature capture is qualified only for llama and qwen35 graph names";
+            return false;
+        }
+        const std::string suffix = name.substr(6);
+        if (suffix.empty() || suffix.size() > 9 ||
+            !std::all_of(suffix.begin(), suffix.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            g_last_error = "Invalid decoder feature tensor name";
+            return false;
+        }
+        const int layer = std::stoi(suffix);
+        if (name != "l_out-" + std::to_string(layer) || layer >= llama_model_n_layer(model)) {
+            g_last_error = "Decoder feature tensor is outside the loaded model";
+            return false;
+        }
+        width = llama_model_n_embd(model);
+    } else {
+        g_last_error = "Unsupported teacher feature tensor; use result_norm or an admitted l_out-N";
+        return false;
+    }
+    vocabulary = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (width <= 0 || vocabulary <= 0) {
+        g_last_error = "Teacher model has invalid vocabulary or feature width";
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 extern "C" {
+
+void* llama_wrapper_teacher_model_load(const char* path, llama_wrapper_model_params options) {
+    if (!path || options.n_gpu_layers < -1 || (options.tensor_split && options.tensor_split[0])) {
+        g_last_error = "Teacher path, valid layer placement and no unsupported tensor split are required";
+        return nullptr;
+    }
+    try {
+        llama_backend_init();
+        auto parameters = llama_model_default_params();
+        parameters.n_gpu_layers = options.n_gpu_layers == -1 ? 999 : options.n_gpu_layers;
+        parameters.main_gpu = options.main_gpu ? std::atoi(options.main_gpu) : 0;
+        parameters.load_mode = options.mlock ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
+        parameters.no_host = false;
+        ggml_backend_dev_t cpu_devices[] = {nullptr};
+        // Zero offloaded layers alone still initializes all discovered GPU
+        // devices when creating a context. An empty device list means CPU.
+        if (options.n_gpu_layers == 0) parameters.devices = cpu_devices;
+        if (options.disable_progress_callback) {
+            parameters.progress_callback = [](float, void*) { return true; };
+        } else if (options.progress_callback) {
+            parameters.progress_callback = options.progress_callback;
+            parameters.progress_callback_user_data = options.progress_callback_user_data;
+        }
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> loaded(llama_model_load_from_file(path, parameters), llama_model_free);
+        if (!loaded) {
+            g_last_error = "Failed to load teacher model";
+            return nullptr;
+        }
+        auto wrapper = std::make_unique<llama_wrapper_model_t>();
+        wrapper->model = loaded.release();
+        wrapper->n_gpu_layers = parameters.n_gpu_layers;
+        return wrapper.release();
+    } catch (const std::exception& e) {
+        g_last_error = "Exception loading teacher model: " + std::string(e.what());
+        return nullptr;
+    }
+}
+
+int llama_wrapper_teacher_geometry(void* model, const char* tensor, int* vocabulary, int* width) {
+    if (!model || !tensor || !vocabulary || !width) {
+        g_last_error = "Teacher model, tensor and geometry outputs are required";
+        return -1;
+    }
+    try {
+        return teacher_geometry(static_cast<llama_wrapper_model_t*>(model)->model, tensor, *vocabulary, *width) ? 0 : -1;
+    } catch (const std::exception& e) {
+        g_last_error = "Exception inspecting teacher geometry: " + std::string(e.what());
+        return -1;
+    }
+}
+
+int llama_wrapper_capture_teacher(void* model, const char* tensor,
+                                  const int* tokens, int n_tokens, const int* positions, int n_positions,
+                                  int top_k, int context_tokens, int window_tokens, int threads, bool cpu_only,
+                                  long long max_window_bytes, int* out_ids, double* out_probabilities,
+                                  long long top_elements, double* out_mass, float* out_features, long long feature_elements) {
+    if (!model || !tensor || !tokens || !positions || !out_ids || !out_probabilities || !out_mass || !out_features ||
+        n_tokens < 2 || n_positions < 1 || top_k < 1 || context_tokens < n_tokens || context_tokens % 256 != 0 || window_tokens < 1 ||
+        window_tokens > context_tokens || threads < 1 || threads > 256 || max_window_bytes < 1) {
+        g_last_error = "Invalid teacher capture pointers, lengths or resource limits";
+        return -1;
+    }
+    try {
+        auto* loaded = static_cast<llama_wrapper_model_t*>(model)->model;
+        if (cpu_only && static_cast<llama_wrapper_model_t*>(model)->n_gpu_layers != 0) {
+            g_last_error = "CPU teacher capture requires CPU-only loaded weights";
+            return -1;
+        }
+        int vocabulary, width;
+        if (!teacher_geometry(loaded, tensor, vocabulary, width)) return -1;
+        if (top_k > vocabulary || top_elements != static_cast<long long>(n_positions) * top_k ||
+            feature_elements != static_cast<long long>(n_positions) * width) {
+            g_last_error = "Teacher output geometry differs from the model and requested rows";
+            return -1;
+        }
+        for (int i = 0; i < n_tokens; ++i) {
+            if (tokens[i] < 0 || tokens[i] >= vocabulary) {
+                g_last_error = "Teacher input token is outside the vocabulary";
+                return -1;
+            }
+        }
+        for (int i = 0; i < n_positions; ++i) {
+            if (positions[i] < 0 || positions[i] >= n_tokens - 1 || (i && positions[i] <= positions[i-1])) {
+                g_last_error = "Teacher positions must increase strictly and have a supplied next token";
+                return -1;
+            }
+        }
+        const long long row_bytes = (static_cast<long long>(vocabulary) + width) * sizeof(float);
+        const long long scratch_bytes = static_cast<long long>(vocabulary) * sizeof(int);
+        const long long memory_rows = (max_window_bytes - scratch_bytes) / row_bytes;
+        if (memory_rows < 1) {
+            g_last_error = "Teacher window budget cannot hold one vocabulary/feature row and top-k scratch";
+            return -1;
+        }
+        const int window = static_cast<int>(std::min(static_cast<long long>(window_tokens), memory_rows));
+        teacher_capture_rows collector{tensor, "", positions, n_positions, width, 0, 0, false, out_features};
+        auto parameters = llama_context_default_params();
+        parameters.n_ctx = context_tokens;
+        parameters.n_batch = window;
+        parameters.n_ubatch = window;
+        parameters.n_outputs_max = window;
+        parameters.n_seq_max = 1;
+        parameters.n_threads = threads;
+        parameters.n_threads_batch = threads;
+        parameters.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        parameters.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+        parameters.embeddings = false;
+        parameters.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        parameters.type_k = GGML_TYPE_F32;
+        parameters.type_v = GGML_TYPE_F32;
+        parameters.offload_kqv = !cpu_only;
+        parameters.op_offload = !cpu_only;
+        parameters.cb_eval = teacher_capture_rows::observe;
+        parameters.cb_eval_user_data = &collector;
+        std::unique_ptr<llama_context, decltype(&llama_free)> context(llama_init_from_model(loaded, parameters), llama_free);
+        if (!context) {
+            g_last_error = "Failed to create the bounded teacher context";
+            return -1;
+        }
+        // This context is new and adapter-free. Only the supplied gold sequence
+        // is decoded, every window row is an output, and no sampler is created.
+        std::vector<int> order(vocabulary);
+        int row = 0;
+        for (int start = 0; start < n_tokens;) {
+            const int count = std::min(window, n_tokens - start);
+            collector.start = start;
+            collector.count = count;
+            collector.seen = false;
+            teacher_batch_guard guard(count);
+            auto& batch = guard.batch;
+            for (int i = 0; i < count; ++i) {
+                batch.token[i] = tokens[start+i];
+                batch.pos[i] = start+i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = 1;
+            }
+            batch.n_tokens = count;
+            const int decoded = llama_decode(context.get(), batch);
+            if (decoded != 0 || !collector.failure.empty() || !collector.seen) {
+                g_last_error = !collector.failure.empty() ? collector.failure :
+                    "Teacher decode failed or did not expose the exact requested feature tensor";
+                return -1;
+            }
+            while (row < n_positions && positions[row] < start + count) {
+                const float* logits = llama_get_logits_ith(context.get(), positions[row]-start);
+                if (!logits) {
+                    g_last_error = "Teacher logits row is unavailable";
+                    return -1;
+                }
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (int token = 0; token < vocabulary; ++token) {
+                    if (!std::isfinite(logits[token])) {
+                        g_last_error = "Teacher logits contain nonfinite values";
+                        return -1;
+                    }
+                    maximum = std::max(maximum, static_cast<double>(logits[token]));
+                }
+                double denominator = 0;
+                for (int token = 0; token < vocabulary; ++token) denominator += std::exp(static_cast<double>(logits[token])-maximum);
+                if (!(denominator > 0) || !std::isfinite(denominator)) {
+                    g_last_error = "Teacher softmax denominator is invalid";
+                    return -1;
+                }
+                std::iota(order.begin(), order.end(), 0);
+                std::partial_sort(order.begin(), order.begin()+top_k, order.end(), [&](int a, int b) {
+                    return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
+                });
+                double mass = 0;
+                for (int k = 0; k < top_k; ++k) {
+                    const size_t offset = static_cast<size_t>(row)*top_k+k;
+                    out_ids[offset] = order[k];
+                    out_probabilities[offset] = std::exp(static_cast<double>(logits[order[k]])-maximum)/denominator;
+                    mass += out_probabilities[offset];
+                }
+                out_mass[row] = mass;
+                ++row;
+            }
+            start += count;
+        }
+        if (row != n_positions) {
+            g_last_error = "Teacher capture did not produce every requested row";
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        g_last_error = "Exception capturing teacher: " + std::string(e.what());
+        return -1;
+    }
+}
 
 void* llama_wrapper_adapter_load(void* model, const char* path) {
     if (!model || !path) {
