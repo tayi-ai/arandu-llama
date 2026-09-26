@@ -193,13 +193,21 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 // gradients in parameter order. It traverses every frozen recurrent block
 // between adapters. The loss and optimizer are deliberately outside this API.
 func (m *TextModel) VJP(ctx context.Context, snapshot *Snapshot, logitCotangent *torch.Tensor) (_ Gradients, err error) {
+	return m.vjp(ctx, snapshot, logitCotangent, nil)
+}
+
+func (m *TextModel) validateSnapshot(ctx context.Context, snapshot *Snapshot, logitCotangent *torch.Tensor) error {
 	if ctx == nil || m == nil || snapshot == nil || snapshot.owner != m || len(snapshot.states) != len(m.Layers)+1 || logitCotangent == nil {
-		return nil, errors.New("ornith: VJP requires this model's live forward snapshot and cotangent")
+		return errors.New("ornith: VJP requires this model's live forward snapshot and cotangent")
 	}
 	if snapshot.generation != m.generation {
-		return nil, ErrStaleSnapshot
+		return ErrStaleSnapshot
 	}
-	if err := ctx.Err(); err != nil {
+	return ctx.Err()
+}
+
+func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent *torch.Tensor, features map[int][]featureCotangent) (_ Gradients, err error) {
+	if err := m.validateSnapshot(ctx, snapshot, logitCotangent); err != nil {
 		return nil, err
 	}
 	firstTrainable := -1
@@ -270,6 +278,14 @@ func (m *TextModel) VJP(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		}
 		_ = current.Close()
 		current = placed
+		if rows := features[index]; len(rows) != 0 {
+			combined, err := addFeatureCotangents(ctx, current, rows)
+			if err != nil {
+				return nil, fmt.Errorf("ornith: layer %d feature cotangent: %w", index, err)
+			}
+			_ = current.Close()
+			current = combined
+		}
 		gradient, err := layers.DecoderVJP(ctx, state, layer.Weights, layer.Adapter, layer.Cosine, layer.Sine, current, layer.Config)
 		if err != nil {
 			return nil, fmt.Errorf("ornith: layer %d backward: %w", index, err)

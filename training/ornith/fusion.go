@@ -31,9 +31,11 @@ type FusionTeacher struct {
 
 // FusionCompletionResult reports the blended objective and LoRA gradients.
 // HardLoss is the pure one-hot completion CE before teacher blending.
+// Loss includes FeatureLoss, the weighted hidden-state MSE, when requested.
 type FusionCompletionResult struct {
 	Loss                 float64
 	HardLoss             float64
+	FeatureLoss          float64
 	Tokens               int
 	EffectiveTeacherMass map[string]float64
 	TeacherLosses        map[string]float64
@@ -44,6 +46,15 @@ type FusionCompletionResult struct {
 // same causal rows used by CompletionGradient. Missing teacher probability mass
 // is assigned back to the hard target, preserving a complete target distribution.
 func FusionCompletionGradient(ctx context.Context, model *TextModel, tokenIDs []int64, promptTokens int, limits Limits, lossScale float64, teachers []FusionTeacher) (result FusionCompletionResult, err error) {
+	return FusionCompletionGradientWithFeatures(ctx, model, tokenIDs, promptTokens, limits, lossScale, teachers, nil)
+}
+
+// FusionCompletionGradientWithFeatures adds projected teacher feature MSE to
+// the causal teacher/gold objective. Features use absolute input-token positions
+// and decoder outputs as defined by FeatureTarget. lossScale multiplies both
+// logit and feature cotangents, while all reported losses remain unscaled.
+// A nil or all-zero-weight feature list reproduces FusionCompletionGradient.
+func FusionCompletionGradientWithFeatures(ctx context.Context, model *TextModel, tokenIDs []int64, promptTokens int, limits Limits, lossScale float64, teachers []FusionTeacher, features []FeatureTarget) (result FusionCompletionResult, err error) {
 	if ctx == nil || model == nil || len(tokenIDs) < 2 || promptTokens < 1 || promptTokens >= len(tokenIDs) {
 		return result, fmt.Errorf("%w: prompt and completion geometry is invalid", ErrCompletionStep)
 	}
@@ -107,9 +118,13 @@ func FusionCompletionGradient(ctx context.Context, model *TextModel, tokenIDs []
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	nativeGradients, err = model.VJP(ctx, snapshot, seed)
+	nativeGradients, result.FeatureLoss, err = model.VJPWithFeatures(ctx, snapshot, seed, features, lossScale)
 	if err != nil {
 		return result, err
+	}
+	result.Loss += result.FeatureLoss
+	if math.IsNaN(result.Loss) || math.IsInf(result.Loss, 0) {
+		return result, fmt.Errorf("%w: nonfinite combined fusion loss", ErrCompletionStep)
 	}
 	if len(nativeGradients) != len(expected) {
 		return result, fmt.Errorf("%w: incomplete parameter gradient set", ErrCompletionStep)
