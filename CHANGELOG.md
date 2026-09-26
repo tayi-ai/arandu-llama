@@ -10,13 +10,22 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+### Changed
+
+- Training uses architecture and role contracts, with installation-owned model
+  identities and recipes supplied explicitly. Existing calculations and artifact
+  integrity checks remain part of the implementation.
+- MX model admission uses an immutable caller-owned catalog. The library no
+  longer selects a production model or publishes operational model pins.
+- Operational identifiers have been removed from this document's current text;
+  previously published versions remain historical releases.
+
 ## [0.5.0] - 2026-09-15
 
 ### Added
 
-- A pinned `deepseek-v4.1-flash-q2_k` MX recipe for the seven-shard Q2_K
-  runtime candidate, with exact revision, 264,515,279,456-byte manifest, and
-  model digest while keeping the qualified Q4 recipe as the default.
+- A pinned seven-shard Q2_K runtime candidate with exact source revision and
+  model manifest, while retaining the then-configured Q4 default.
 - `MXModelRecipeForDigest` recovers an admitted model recipe from its persisted
   model digest and rejects empty, unknown, or ambiguous identities.
 

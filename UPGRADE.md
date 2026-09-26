@@ -2,11 +2,29 @@
 
 ## Unreleased
 
+Model identities now belong to private installation configuration. Construct
+`NewMXCatalog` from typed `MXModelIdentity` entries and pass the selected identity
+in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard
+identity remain mandatory; externalizing configuration does not waive lineage,
+artifact integrity or license obligations.
+
+Replace `AdmittedMXManifest` and `AdmittedMXManifestFor` with
+`MXCatalog.ManifestFor`. Replace `MXModelRecipeForDigest` with
+`MXCatalog.RecipeForDigest`. Replace `MXModelMXFP4`, `MXModelQ2K` and
+`MXModelTayiQ2Progressive` with installation-owned `MXModelRecipe` selectors.
+`MXConfig.ModelRecipe` becomes `MXConfig.Model`. No model is selected by omission.
+Runtime binary identities and the qualified SM75/64-backend build are unchanged.
+
+Training backends use `training/decoder`; geometry, initial projections, rotary
+parameters and local recipes must be supplied explicitly. Checkpoint inspection
+and resumption retain artifact checks. A configuration's admission is not proof
+that a new architecture or training recipe has been scientifically qualified.
+
 ## v0.5.0
 
-The existing Q4 MX recipe remains the default. Q2 callers must select
-`deepseek-v4.1-flash-q2_k` explicitly and materialize the exact seven-shard
-manifest admitted by that recipe. Persist the recipe digest with the execution;
+This historical release retained its Q4 MX default. Q2 callers selected an
+explicit recipe and materialized the exact seven-shard manifest admitted by
+that recipe. Persist the recipe digest with the execution;
 `MXModelRecipeForDigest` can recover only a uniquely admitted digest and rejects
 unknown or ambiguous values.
 

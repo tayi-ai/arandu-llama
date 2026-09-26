@@ -1,7 +1,7 @@
 # Backend mx-llama.cpp
 
-Este backend adiciona a execução qualificada do DeepSeek-V4.1-Flash sem
-substituir o backend `llama.cpp` já integrado ao módulo. O código Go nunca
+Este backend adiciona execução por um runtime nativo versionado, preservando
+o backend `llama.cpp` já integrado ao módulo. O código Go nunca
 recebe uma linha de shell, um caminho de executável ou um caminho de modelo da
 requisição. Ele produz um `NativeProcess` tipado depois de validar a topologia,
 os limites e os arquivos instalados.
