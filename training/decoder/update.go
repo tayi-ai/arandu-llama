@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"bytes"
@@ -15,18 +15,18 @@ import (
 )
 
 // ErrParameters reports an invalid adapter registry, ownership, or FP32 vector.
-var ErrParameters = errors.New("ornith: parameter replacement rejected")
+var ErrParameters = errors.New("decoder: parameter replacement rejected")
 
 // ErrParameterRelease reports a native release failure after a committed
 // replacement. The returned digest is nonempty; the new parameters are active.
 // Failed releases remain owned for Close to retry. The caller must abort its job
 // instead of treating this as an uncommitted update or retrying the replacement.
-var ErrParameterRelease = errors.New("ornith: parameters committed but old handle release failed")
+var ErrParameterRelease = errors.New("decoder: parameters committed but old handle release failed")
 
-// ReplaceParameters atomically installs the 557056 ordered FP32 adapter values.
-// Names/shapes follow InitializeAdapter: layers 3,7,...31, q/v projection, A/B.
+// ReplaceParameters atomically installs the ordered FP32 adapter values.
+// Names and shapes follow the model's admitted adapter registry.
 // It validates all values and current registry metadata before native allocation,
-// preserves each parameter's device, and materializes all 32 new leaves before
+// preserves each parameter's device, and materializes all new leaves before
 // changing any model reference. Base tensors and initializer receipts are intact.
 // The returned digest hashes each UTF-8 name then its little-endian FP32 bytes.
 //
@@ -36,11 +36,11 @@ var ErrParameterRelease = errors.New("ornith: parameters committed but old handl
 // cancellation failure returns an empty digest with every old reference intact.
 // Cancellation is checked between native operations, not inside a running one.
 // Native release errors after commit have the distinct ErrParameterRelease state.
-// An adapter-only fixture may transfer its exact 32 referenced handles with an
+// An adapter-only fixture may transfer its exact referenced handles with an
 // empty owned registry; otherwise every old parameter must already be owned once.
 func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float32) (digest string, err error) {
-	if ctx == nil || m == nil || m.Model == nil || len(m.Model.Layers) != 32 || len(m.Parameters) != 32 ||
-		len(values) != 557056 || m.Model.generation == math.MaxUint64 {
+	if ctx == nil || m == nil || m.Model == nil || len(m.Model.Layers) == 0 || len(m.Parameters) == 0 ||
+		len(values) == 0 || m.Model.generation == math.MaxUint64 {
 		return "", ErrParameters
 	}
 	if err := ctx.Err(); err != nil {
@@ -57,7 +57,19 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 			return "", fmt.Errorf("%w: nonfinite value", ErrParameters)
 		}
 	}
-	_, expected := assemblyGeometry()
+	registry, registryErr := candidateParameters(m.Model)
+	if registryErr != nil {
+		return "", errors.Join(ErrParameters, registryErr)
+	}
+	expected := make([]AssemblyTensor, len(registry))
+	var elements int64
+	for i, p := range registry {
+		expected[i] = AssemblyTensor{ReferenceName: p.name, Shape: p.info.Shape, Bytes: p.info.Elements * 4}
+		elements += p.info.Elements
+	}
+	if len(m.Parameters) != len(expected) || elements != int64(len(values)) {
+		return "", ErrParameters
+	}
 	devices, oldIndex, err := m.validateParameterRegistry(ctx, expected)
 	if err != nil {
 		return "", err
@@ -113,13 +125,19 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 	if start != int64(len(raw)) {
 		return "", ErrParameters
 	}
-	var nextAdapters [8]*layers.AttentionLoRA
+	var layerIndices []int
+	for i, layer := range m.Model.Layers {
+		if layer.Adapter != nil {
+			layerIndices = append(layerIndices, i)
+		}
+	}
+	nextAdapters := make([]*layers.AttentionLoRA, len(layerIndices))
 	for i := range nextAdapters {
 		base := i * 4
 		nextAdapters[i] = &layers.AttentionLoRA{QueryA: prepared[base].Value, QueryB: prepared[base+1].Value,
-			ValueA: prepared[base+2].Value, ValueB: prepared[base+3].Value, Alpha: 8}
+			ValueA: prepared[base+2].Value, ValueB: prepared[base+3].Value, Alpha: m.Model.Layers[layerIndices[i]].Adapter.Alpha}
 	}
-	nextOwned := make([]*torch.Tensor, 0, len(m.owned)+32)
+	nextOwned := make([]*torch.Tensor, 0, len(m.owned)+len(prepared))
 	if len(m.owned) == 0 {
 		for _, parameter := range prepared {
 			nextOwned = append(nextOwned, parameter.Value)
@@ -141,7 +159,7 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 	// cancellation point can expose a partially replaced parameter registry.
 	old := m.Parameters
 	for i, adapter := range nextAdapters {
-		m.Model.Layers[3+i*4].Adapter = adapter
+		m.Model.Layers[layerIndices[i]].Adapter = adapter
 	}
 	m.Parameters, m.owned = prepared, nextOwned
 	m.Model.generation++
@@ -162,17 +180,35 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 func (m *LoadedTextModel) validateParameterRegistry(ctx context.Context, expected []AssemblyTensor) ([]torch.Device, map[torch.Tensor]int, error) {
 	devices := make([]torch.Device, len(expected))
 	oldIndex := make(map[torch.Tensor]int, len(expected))
+	var layerIndices []int
 	for i, layer := range m.Model.Layers {
-		if (i%4 == 3) != (layer.Adapter != nil) || layer.Adapter != nil && layer.Adapter.Alpha != 8 {
-			return nil, nil, fmt.Errorf("%w: full-attention adapter layout differs", ErrParameters)
+		if layer.Adapter != nil {
+			if layer.Adapter.Alpha <= 0 || math.IsNaN(layer.Adapter.Alpha) || math.IsInf(layer.Adapter.Alpha, 0) {
+				return nil, nil, ErrParameters
+			}
+			for _, pair := range [][2]*torch.Tensor{{layer.Adapter.QueryA, layer.Adapter.QueryB}, {layer.Adapter.ValueA, layer.Adapter.ValueB}} {
+				a, err := pair[0].Info()
+				if err != nil {
+					return nil, nil, errors.Join(ErrParameters, err)
+				}
+				b, err := pair[1].Info()
+				if err != nil {
+					return nil, nil, errors.Join(ErrParameters, err)
+				}
+				if len(a.Shape) != 2 || len(b.Shape) != 2 || a.Shape[0] != b.Shape[1] {
+					return nil, nil, fmt.Errorf("%w: projection rank differs", ErrParameters)
+				}
+			}
+			layerIndices = append(layerIndices, i)
 		}
 	}
+
 	for i, item := range expected {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 		parameter := m.Parameters[i]
-		layer := m.Model.Layers[3+(i/4)*4]
+		layer := m.Model.Layers[layerIndices[i/4]]
 		a := layer.Adapter
 		references := [4]*torch.Tensor{a.QueryA, a.QueryB, a.ValueA, a.ValueB}
 		if parameter.Name != item.ReferenceName || parameter.Value == nil || references[i%4] != parameter.Value {

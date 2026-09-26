@@ -154,7 +154,7 @@ func GradVJP(ctx context.Context, input Input, dValues, dFinalState *torch.Tenso
 }
 
 func forward(ctx context.Context, input Input, g geometry) (result *Output, err error) {
-	// Qwen3.5 uses the chunked Gated Delta rule for multi-token sequences. The
+	// hybrid decoder uses the chunked Gated Delta rule for multi-token sequences. The
 	// token-by-token recurrence is mathematically equivalent but accumulates
 	// substantially more rounding error on long FP32 prompts. Reproduce the
 	// reference chunk transform here while keeping the existing Go-owned graph.

@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 )
 
 // ErrCompletionStep identifies invalid autoregressive completion training data.
-var ErrCompletionStep = errors.New("ornith: completion calculation rejected")
+var ErrCompletionStep = errors.New("decoder: completion calculation rejected")
 
 // CompletionParameterGradient owns a detached Go FP32 copy of one trainable
 // adapter cotangent. Names and ordering follow the model's frozen PEFT layout.

@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -71,10 +71,10 @@ func observeForward(ctx context.Context, observer ForwardObserver, stage Forward
 	}
 	observation, err := scanForward(ctx, stage, layer, value)
 	if err != nil {
-		return fmt.Errorf("ornith: observe %s layer %d: %w", stage, layer, err)
+		return fmt.Errorf("decoder: observe %s layer %d: %w", stage, layer, err)
 	}
 	if err = observer(ctx, observation); err != nil {
-		return fmt.Errorf("ornith: observer %s layer %d: %w", stage, layer, err)
+		return fmt.Errorf("decoder: observer %s layer %d: %w", stage, layer, err)
 	}
 	return ctx.Err()
 }

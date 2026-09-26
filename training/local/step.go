@@ -16,12 +16,12 @@ import (
 	"path/filepath"
 
 	"github.com/tayi-ai/arandu-llama/checkpoint"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 )
 
-func forwardFingerprint(ctx context.Context, model *ornith.TextModel, ids []int64, promptTokens int64) (string, error) {
+func forwardFingerprint(ctx context.Context, model *decoder.TextModel, ids []int64, promptTokens int64, maxCheckpointBytes int64) (string, error) {
 	tokens := int64(len(ids))
-	snapshot, err := model.Forward(ctx, ids, ornith.Limits{MaxTokens: tokens, LogitRows: tokens - promptTokens + 1, MaxCheckpointBytes: tokens * 4096 * 68})
+	snapshot, err := model.Forward(ctx, ids, decoder.Limits{MaxTokens: tokens, LogitRows: tokens - promptTokens + 1, MaxCheckpointBytes: maxCheckpointBytes})
 	if err != nil {
 		return "", err
 	}
@@ -80,14 +80,14 @@ func writeAndReadback(ctx context.Context, path string, tensors []checkpoint.Flo
 	return receipt, nil
 }
 
-func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextModel, row example, gradient ornith.CompletionGradientResult, before, output string) error {
-	if len(loaded.Parameters) != 32 || len(gradient.Gradients) != 32 || gradient.Tokens != len(row.InputIDs)-row.PromptTokens {
+func applyAndVerifyFirstUpdate(ctx context.Context, loaded *decoder.LoadedTextModel, row example, gradient decoder.CompletionGradientResult, before, output string, recipe Recipe) error {
+	if len(loaded.Parameters) == 0 || len(gradient.Gradients) != len(loaded.Parameters) || gradient.Tokens != len(row.InputIDs)-row.PromptTokens {
 		return errors.New("incomplete first update inputs")
 	}
-	const learningRate = 2e-6
-	const beta1, beta2, epsilon = .9, .999, 1e-8
-	values := make([]float32, 0, 557056)
-	grads := make([]float32, 0, 557056)
+	learningRate := recipe.Optimizer.LearningRate
+	beta1, beta2, epsilon := recipe.Optimizer.Beta1, recipe.Optimizer.Beta2, recipe.Optimizer.Epsilon
+	values := make([]float32, 0, loaded.Summary.AdapterElements)
+	grads := make([]float32, 0, loaded.Summary.AdapterElements)
 	for i, item := range loaded.Parameters {
 		if item.Name != gradient.Gradients[i].Name {
 			return errors.New("gradient order differs from adapter")
@@ -99,7 +99,7 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 		values = append(values, current...)
 		grads = append(grads, gradient.Gradients[i].ValuesF32...)
 	}
-	if len(values) != 557056 || len(grads) != 557056 {
+	if int64(len(values)) != loaded.Summary.AdapterElements || len(grads) != len(values) {
 		return errors.New("first update parameter count differs")
 	}
 	var normSquared float64
@@ -110,7 +110,7 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 	if math.IsNaN(norm) || math.IsInf(norm, 0) || norm == 0 {
 		return errors.New("invalid first update gradient norm")
 	}
-	clip := math.Min(1, 1/(norm+1e-12))
+	clip := math.Min(1, recipe.Optimizer.MaxGradientNorm/(norm+1e-12))
 	first, second := make([]float32, len(values)), make([]float32, len(values))
 	updated := make([]float32, len(values))
 	changed := 0
@@ -120,7 +120,7 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 		second[i] = float32((1 - beta2) * float64(g*g))
 		mhat := float64(first[i]) / (1 - beta1)
 		vhat := float64(second[i]) / (1 - beta2)
-		updated[i] = float32(float64(values[i]) - learningRate*mhat/(math.Sqrt(vhat)+epsilon))
+		updated[i] = float32(float64(values[i])*(1-learningRate*recipe.Optimizer.WeightDecay) - learningRate*mhat/(math.Sqrt(vhat)+epsilon))
 		if math.IsNaN(float64(updated[i])) || math.IsInf(float64(updated[i]), 0) {
 			return errors.New("nonfinite first update")
 		}
@@ -134,7 +134,7 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 	if err := os.Mkdir(output, 0700); err != nil {
 		return err
 	}
-	adapter, moments := make([]checkpoint.Float32Tensor, 0, 32), make([]checkpoint.Float32Tensor, 0, 64)
+	adapter, moments := make([]checkpoint.Float32Tensor, 0, len(loaded.Parameters)), make([]checkpoint.Float32Tensor, 0, 2*len(loaded.Parameters))
 	position := 0
 	for _, parameter := range loaded.Parameters {
 		info, err := parameter.Value.Info()
@@ -160,23 +160,23 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 		return err
 	}
 	digest, err := loaded.ReplaceParameters(ctx, updated)
-	if err != nil || digest == initialDigest {
+	if err != nil || digest == recipe.Initializer.ExpectedSHA256 {
 		return errors.Join(errors.New("first update was not installed"), err)
 	}
-	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens), recipe.MaxCheckpointBytes)
 	if err != nil {
 		return err
 	}
 	manifest := map[string]any{
-		"schema_version": 1, "mode": "arasa-local-adamw-v1", "step": 1, "batch": 1,
+		"recipe_sha256": recipe.Digest(), "schema_version": 1, "mode": recipe.Method, "step": 1, "batch": 1,
 		"example_id": row.ID, "supervised_tokens": gradient.Tokens, "loss_before": gradient.Loss,
 		"learning_rate": learningRate, "betas": [2]float64{beta1, beta2}, "epsilon": epsilon,
-		"weight_decay": 0, "gradient_clip": 1, "gradient_norm": norm, "clip_coefficient": clip,
-		"changed_parameters": changed, "initial_adapter_sha256": initialDigest,
+		"weight_decay": recipe.Optimizer.WeightDecay, "gradient_clip": recipe.Optimizer.MaxGradientNorm, "gradient_norm": norm, "clip_coefficient": clip,
+		"changed_parameters": changed, "initial_adapter_sha256": recipe.Initializer.ExpectedSHA256,
 		"updated_adapter_sha256": digest, "adapter_file_sha256": adapterReceipt.SHA256,
 		"optimizer_file_sha256": momentsReceipt.SHA256,
 		"logits_before_sha256":  before, "logits_after_sha256": after, "inference_changed": before != after,
-		"base_revision": "489cb97981b8654bcfcf30ce1f94ed1b62e07b53",
+		"base_revision": recipe.BaseRevision,
 	}
 	body, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -191,7 +191,7 @@ func applyAndVerifyFirstUpdate(ctx context.Context, loaded *ornith.LoadedTextMod
 	return nil
 }
 
-func reloadAndVerifyAdapter(ctx context.Context, loaded *ornith.LoadedTextModel, row example, directory string) error {
+func reloadAndVerifyAdapter(ctx context.Context, loaded *decoder.LoadedTextModel, row example, directory string, recipe Recipe) error {
 	body, err := os.ReadFile(filepath.Join(directory, "manifest.json"))
 	if err != nil {
 		return err
@@ -206,7 +206,7 @@ func reloadAndVerifyAdapter(ctx context.Context, loaded *ornith.LoadedTextModel,
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		return err
 	}
-	if manifest.Step != 1 || manifest.BaseRevision != "489cb97981b8654bcfcf30ce1f94ed1b62e07b53" {
+	if manifest.Step != 1 || manifest.BaseRevision != recipe.BaseRevision {
 		return errors.New("checkpoint manifest identity differs")
 	}
 	file, err := os.Open(filepath.Join(directory, "adapter_model.safetensors"))
@@ -226,7 +226,7 @@ func reloadAndVerifyAdapter(ctx context.Context, loaded *ornith.LoadedTextModel,
 	if err != nil || len(index.Tensors()) != len(loaded.Parameters) {
 		return errors.New("saved adapter tensor index differs")
 	}
-	values := make([]float32, 0, 557056)
+	values := make([]float32, 0, loaded.Summary.AdapterElements)
 	for _, parameter := range loaded.Parameters {
 		tensor, ok := index.Tensor(parameter.Name)
 		if !ok || tensor.DType != "F32" {
@@ -252,7 +252,7 @@ func reloadAndVerifyAdapter(ctx context.Context, loaded *ornith.LoadedTextModel,
 	if err != nil || digest != manifest.AdapterSHA256 {
 		return errors.New("reloaded adapter identity differs")
 	}
-	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens), recipe.MaxCheckpointBytes)
 	if err != nil || after != manifest.LogitsAfterSHA256 {
 		return errors.New("reloaded adapter inference differs")
 	}

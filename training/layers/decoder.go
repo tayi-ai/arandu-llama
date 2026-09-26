@@ -7,7 +7,7 @@ import (
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-// DecoderWeights describes one frozen Qwen3.5 decoder. Exactly one attention
+// DecoderWeights describes one frozen hybrid decoder decoder. Exactly one attention
 // variant is supplied. LoRA belongs only to a full-attention variant.
 type DecoderWeights struct {
 	InputNorm, PostAttentionNorm, Gate, Up, Down *torch.Tensor

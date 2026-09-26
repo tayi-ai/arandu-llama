@@ -2,34 +2,7 @@
 
 package local
 
-import (
-	"context"
-	"errors"
-)
+import "context"
 
-// ErrUnavailable refuses local training without the pinned native backend.
-var ErrUnavailable = errors.New("local training: LibTorch backend unavailable")
-
-// Config fixes one bounded, resumable local Ornith training delivery.
-type Config struct {
-	BundleDir         string
-	ModelDir          string
-	DataPath          string
-	CheckpointRoot    string
-	InitialCheckpoint string
-	MaxTokens         int
-	MaxSteps          int
-}
-
-// Progress identifies the latest complete checkpoint of this delivery.
-type Progress struct {
-	Step       uint64
-	ExampleID  string
-	Checkpoint string
-}
-
-// LatestCheckpoint refuses inspection without the native backend.
-func LatestCheckpoint(Config) (Progress, error) { return Progress{}, ErrUnavailable }
-
-// Run refuses training without the native backend.
+// Run refuses native calculation without the required backend.
 func Run(context.Context, Config) (Progress, error) { return Progress{}, ErrUnavailable }

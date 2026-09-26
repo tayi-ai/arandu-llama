@@ -7,19 +7,21 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	testfixture "github.com/tayi-ai/arandu-llama/tests/Unit/Training/Fixture"
 	"testing"
 
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
 func TestCompleteCPUInitialSetIsBorrowedAndGPUBackendMustBeExplicit(t *testing.T) {
-	initial, err := ornith.InitializeAdapter(context.Background(), ornith.InitialAdapterSpec{Seed: 83, PreludeBlocks: 24, ExpectedSHA256: initialDigest})
+	initial, err := decoder.InitializeAdapter(context.Background(), testfixture.Spec(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer initial.Close()
 	d := fixture()
+	d.InitialSHA = initial.SHA256
 	content := map[string]string{}
 	for _, parameter := range initial.Parameters {
 		raw, err := parameter.Value.Bytes()
@@ -35,7 +37,7 @@ func TestCompleteCPUInitialSetIsBorrowedAndGPUBackendMustBeExplicit(t *testing.T
 	}
 	p := plan(t, d)
 	source := provider(t, p, nil)
-	model, err := ornith.LoadTextAssembly(context.Background(), p, source, initial)
+	model, err := decoder.LoadTextAssembly(context.Background(), p, source, initial)
 	if model != nil || !errors.Is(err, torch.ErrCUDAUnavailable) || source.opens != 0 {
 		t.Fatalf("CPU build reached GPU placement: %v", err)
 	}
@@ -58,7 +60,7 @@ func TestCompleteCPUInitialSetIsBorrowedAndGPUBackendMustBeExplicit(t *testing.T
 	}
 	p = plan(t, d)
 	source = provider(t, p, nil)
-	if model, err := ornith.LoadTextAssembly(context.Background(), p, source, initial); model != nil || !errors.Is(err, ornith.ErrAssembly) || source.opens != 0 {
+	if model, err := decoder.LoadTextAssembly(context.Background(), p, source, initial); model != nil || !errors.Is(err, decoder.ErrAssembly) || source.opens != 0 {
 		t.Fatalf("adapter hash bypass:%v", err)
 	}
 }

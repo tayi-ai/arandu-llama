@@ -9,16 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/tayi-ai/arandu-llama/checkpoint"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/sequence"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-const initialDigest = "75185d68fcfdd09bb2dcb6dffe0902a35300f52d9fda716b408189991773aa7c"
+var initialDigest = strings.Repeat("1", 64)
 
 type reference struct {
 	Name   string  `json:"name"`
@@ -32,9 +33,10 @@ type reference struct {
 }
 
 type documents struct {
-	Index     map[string]string
-	Reference []reference
-	Config    map[string]any
+	InitialSHA string
+	Index      map[string]string
+	Reference  []reference
+	Config     map[string]any
 }
 
 func fixture() documents {
@@ -98,8 +100,8 @@ func fixture() documents {
 	}
 	add("model.language_model.norm.weight", []int64{4096}, "torch.float16", 1, false)
 	add("lm_head.weight", []int64{248320, 4096}, "torch.float16", 1, false)
-	d.Config = map[string]any{"model_type": "qwen3_5", "tie_word_embeddings": false, "text_config": map[string]any{
-		"model_type": "qwen3_5_text", "hidden_size": 4096, "vocab_size": 248320, "intermediate_size": 12288, "num_hidden_layers": 32,
+	d.Config = map[string]any{"model_type": "hybrid", "tie_word_embeddings": false, "text_config": map[string]any{
+		"model_type": "hybrid_text", "hidden_size": 4096, "vocab_size": 248320, "intermediate_size": 12288, "num_hidden_layers": 32,
 		"num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256, "layer_types": kinds,
 		"linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4,
 		"rms_norm_eps": 1e-6, "hidden_act": "silu", "attention_bias": false, "attention_dropout": 0, "attn_output_gate": true, "tie_word_embeddings": false,
@@ -108,12 +110,12 @@ func fixture() documents {
 	return d
 }
 
-func admittedLimits() ornith.AssemblyLimits {
-	return ornith.AssemblyLimits{HeaderLimits: checkpoint.DefaultLimits(), TensorCopyBytes: 6_102_712_320, PersistentBytes: [2]int64{11_042_374_656, 11_042_382_848}, HashChunkBytes: 4096,
+func admittedLimits() decoder.AssemblyLimits {
+	return decoder.AssemblyLimits{HeaderLimits: checkpoint.DefaultLimits(), TensorCopyBytes: 6_102_712_320, AdapterRank: 4, AdapterAlpha: 8, DeviceByLayer: fixturePlacement(), EmbeddingDevice: 0, OutputDevice: 1, PersistentBytes: []int64{11_042_374_656, 11_042_382_848}, HashChunkBytes: 4096,
 		MaxInputElements: 4096 * 4096, MaxScoreElements: 16 * 4096 * 4096, MaxWorkingElements: 256 << 20, Sequence: sequence.DefaultLimits()}
 }
 
-func (d documents) encode(t *testing.T) ([]byte, []byte, []byte, ornith.AssemblyIdentity) {
+func (d documents) encode(t *testing.T) ([]byte, []byte, []byte, decoder.AssemblyIdentity) {
 	t.Helper()
 	marshal := func(v any) []byte {
 		data, err := json.Marshal(v)
@@ -125,13 +127,13 @@ func (d documents) encode(t *testing.T) ([]byte, []byte, []byte, ornith.Assembly
 	index := marshal(map[string]any{"weight_map": d.Index})
 	config := marshal(d.Config)
 	reference := marshal(map[string]any{"tensors": d.Reference})
-	return index, config, reference, ornith.AssemblyIdentity{IndexSHA256: fmt.Sprintf("%x", sha256.Sum256(index)), ConfigSHA256: fmt.Sprintf("%x", sha256.Sum256(config)), ReferenceSHA256: fmt.Sprintf("%x", sha256.Sum256(reference)), InitialAdapterSHA256: initialDigest}
+	return index, config, reference, decoder.AssemblyIdentity{IndexSHA256: fmt.Sprintf("%x", sha256.Sum256(index)), ConfigSHA256: fmt.Sprintf("%x", sha256.Sum256(config)), ReferenceSHA256: fmt.Sprintf("%x", sha256.Sum256(reference)), InitialAdapterSHA256: d.initialSHA()}
 }
 
-func plan(t *testing.T, d documents) *ornith.AssemblyPlan {
+func plan(t *testing.T, d documents) *decoder.AssemblyPlan {
 	t.Helper()
 	i, c, r, id := d.encode(t)
-	p, err := ornith.PlanTextAssembly(i, c, r, id, admittedLimits())
+	p, err := decoder.PlanTextAssembly(i, c, r, id, admittedLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,14 +144,14 @@ func TestLocalMPSAssemblyPreservesFrozenReferenceAndRequiresAggregateBudget(t *t
 	i, c, r, id := fixture().encode(t)
 	limits := admittedLimits()
 	needed := limits.PersistentBytes[0] + limits.PersistentBytes[1]
-	if p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed-1); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+	if p, err := decoder.PlanLocalMPSAssembly(i, c, r, id, limits, needed-1); p != nil || !errors.Is(err, decoder.ErrAssembly) {
 		t.Fatalf("under-budget MPS plan accepted: %v", err)
 	}
-	p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed)
+	p, err := decoder.PlanLocalMPSAssembly(i, c, r, id, limits, needed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Summary().LocalMPSBytes != needed || p.Summary().PersistentBytes != limits.PersistentBytes {
+	if p.Summary().LocalMPSBytes != needed || !slices.Equal(p.Summary().PersistentBytes, limits.PersistentBytes) {
 		t.Fatalf("local placement budget or frozen reference changed: %+v", p.Summary())
 	}
 	for _, item := range p.Tensors() {
@@ -160,7 +162,7 @@ func TestLocalMPSAssemblyPreservesFrozenReferenceAndRequiresAggregateBudget(t *t
 	badReference := fixture()
 	badReference.Reference[0].Device = "mps"
 	i, c, r, id = badReference.encode(t)
-	if p, err := ornith.PlanLocalMPSAssembly(i, c, r, id, limits, needed); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+	if p, err := decoder.PlanLocalMPSAssembly(i, c, r, id, limits, needed); p != nil || !errors.Is(err, decoder.ErrAssembly) {
 		t.Fatalf("modified frozen reference accepted: %v", err)
 	}
 }
@@ -168,7 +170,7 @@ func TestLocalMPSAssemblyPreservesFrozenReferenceAndRequiresAggregateBudget(t *t
 func TestFixedTextAssemblyPlanAndOwnedMetadata(t *testing.T) {
 	p := plan(t, fixture())
 	summary := p.Summary()
-	if summary.BaseTensors != 427 || summary.AdapterTensors != 32 || summary.AdapterElements != 557056 || summary.PersistentBytes != admittedLimits().PersistentBytes {
+	if summary.BaseTensors != 427 || summary.AdapterTensors != 32 || summary.AdapterElements != 557056 || !slices.Equal(summary.PersistentBytes, admittedLimits().PersistentBytes) {
 		t.Fatalf("geometry:%+v", summary)
 	}
 	metadata := p.Tensors()
@@ -208,31 +210,31 @@ func TestFixedTextAssemblyPlanAndOwnedMetadata(t *testing.T) {
 func TestPlanRejectsIdentityGeometryAndBudgetBeforeOpeningSources(t *testing.T) {
 	cases := []struct {
 		name   string
-		change func(*documents, *ornith.AssemblyLimits)
+		change func(*documents, *decoder.AssemblyLimits)
 	}{
-		{"missing_reference", func(d *documents, l *ornith.AssemblyLimits) { d.Reference = d.Reference[1:] }},
-		{"duplicate_reference", func(d *documents, l *ornith.AssemblyLimits) { d.Reference = append(d.Reference, d.Reference[0]) }},
-		{"shape", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].Shape = []int64{1, 4096} }},
-		{"dtype", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].DType = "torch.float32" }},
-		{"device", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].Device = "cuda:1" }},
-		{"trainable_base", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].Grad = true }},
-		{"byte_count", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].Bytes-- }},
-		{"malformed_tensor_hash", func(d *documents, l *ornith.AssemblyLimits) { d.Reference[0].Hash = "missing" }},
-		{"missing_shard", func(d *documents, l *ornith.AssemblyLimits) { delete(d.Index, "lm_head.weight") }},
-		{"traversal", func(d *documents, l *ornith.AssemblyLimits) { d.Index["lm_head.weight"] = "../weights.safetensors" }},
-		{"unexpected_text", func(d *documents, l *ornith.AssemblyLimits) {
+		{"missing_reference", func(d *documents, l *decoder.AssemblyLimits) { d.Reference = d.Reference[1:] }},
+		{"duplicate_reference", func(d *documents, l *decoder.AssemblyLimits) { d.Reference = append(d.Reference, d.Reference[0]) }},
+		{"shape", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].Shape = []int64{1, 4096} }},
+		{"dtype", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].DType = "torch.float32" }},
+		{"device", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].Device = "cuda:1" }},
+		{"trainable_base", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].Grad = true }},
+		{"byte_count", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].Bytes-- }},
+		{"malformed_tensor_hash", func(d *documents, l *decoder.AssemblyLimits) { d.Reference[0].Hash = "missing" }},
+		{"missing_shard", func(d *documents, l *decoder.AssemblyLimits) { delete(d.Index, "lm_head.weight") }},
+		{"traversal", func(d *documents, l *decoder.AssemblyLimits) { d.Index["lm_head.weight"] = "../weights.safetensors" }},
+		{"unexpected_text", func(d *documents, l *decoder.AssemblyLimits) {
 			d.Index["model.language_model.extra.weight"] = "model-00001-of-00004.safetensors"
 		}},
-		{"hidden_geometry", func(d *documents, l *ornith.AssemblyLimits) {
+		{"hidden_geometry", func(d *documents, l *decoder.AssemblyLimits) {
 			d.Config["text_config"].(map[string]any)["hidden_size"] = 2048
 		}},
-		{"wrong_layers", func(d *documents, l *ornith.AssemblyLimits) {
+		{"wrong_layers", func(d *documents, l *decoder.AssemblyLimits) {
 			d.Config["text_config"].(map[string]any)["layer_types"].([]string)[3] = "linear_attention"
 		}},
-		{"copy_budget", func(d *documents, l *ornith.AssemblyLimits) { l.TensorCopyBytes-- }},
-		{"persistent_budget", func(d *documents, l *ornith.AssemblyLimits) { l.PersistentBytes[1]-- }},
-		{"zero_working", func(d *documents, l *ornith.AssemblyLimits) { l.MaxWorkingElements = 0 }},
-		{"unavailable_chunk", func(d *documents, l *ornith.AssemblyLimits) { l.Sequence.ChunkTokens = 33 }},
+		{"copy_budget", func(d *documents, l *decoder.AssemblyLimits) { l.TensorCopyBytes-- }},
+		{"persistent_budget", func(d *documents, l *decoder.AssemblyLimits) { l.PersistentBytes[1]-- }},
+		{"zero_working", func(d *documents, l *decoder.AssemblyLimits) { l.MaxWorkingElements = 0 }},
+		{"unavailable_chunk", func(d *documents, l *decoder.AssemblyLimits) { l.Sequence.ChunkTokens = 33 }},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -240,20 +242,20 @@ func TestPlanRejectsIdentityGeometryAndBudgetBeforeOpeningSources(t *testing.T) 
 			limits := admittedLimits()
 			test.change(&d, &limits)
 			i, c, r, id := d.encode(t)
-			p, err := ornith.PlanTextAssembly(i, c, r, id, limits)
-			if p != nil || !errors.Is(err, ornith.ErrAssembly) {
+			p, err := decoder.PlanTextAssembly(i, c, r, id, limits)
+			if p != nil || !errors.Is(err, decoder.ErrAssembly) {
 				t.Fatalf("invalid plan accepted:%v", err)
 			}
 		})
 	}
 	i, c, r, id := fixture().encode(t)
 	c = append(c, ' ')
-	if p, err := ornith.PlanTextAssembly(i, c, r, id, admittedLimits()); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+	if p, err := decoder.PlanTextAssembly(i, c, r, id, admittedLimits()); p != nil || !errors.Is(err, decoder.ErrAssembly) {
 		t.Fatal("changed document identity accepted")
 	}
 	i, c, r, id = fixture().encode(t)
 	id.InitialAdapterSHA256 = ""
-	if p, err := ornith.PlanTextAssembly(i, c, r, id, admittedLimits()); p != nil || !errors.Is(err, ornith.ErrAssembly) {
+	if p, err := decoder.PlanTextAssembly(i, c, r, id, admittedLimits()); p != nil || !errors.Is(err, decoder.ErrAssembly) {
 		t.Fatal("missing initialization identity accepted")
 	}
 }
@@ -287,12 +289,12 @@ type virtualProvider struct {
 	openErr error
 }
 
-func (p *virtualProvider) OpenShard(ctx context.Context, name string) (ornith.Shard, error) {
+func (p *virtualProvider) OpenShard(ctx context.Context, name string) (decoder.Shard, error) {
 	p.opens++
 	return p.shards[name], p.openErr
 }
 
-func provider(t *testing.T, p *ornith.AssemblyPlan, mutate func(string, *checkpoint.Tensor)) *virtualProvider {
+func provider(t *testing.T, p *decoder.AssemblyPlan, mutate func(string, *checkpoint.Tensor)) *virtualProvider {
 	t.Helper()
 	result := &virtualProvider{shards: map[string]*virtualShard{}}
 	byShard := map[string]map[string]any{}
@@ -354,7 +356,7 @@ func assertOnlyHeadersAndClosed(t *testing.T, source *virtualProvider) {
 func TestInspectVirtualMultiGigabyteShardsOnlyReadsHeaders(t *testing.T) {
 	p := plan(t, fixture())
 	source := provider(t, p, nil)
-	inspection, err := ornith.InspectAssemblySources(context.Background(), p, source)
+	inspection, err := decoder.InspectAssemblySources(context.Background(), p, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,8 +395,8 @@ func TestInspectRejectsSourceTamperingAndLargerConversionBeforePayload(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			p := plan(t, fixture())
 			source := provider(t, p, test.mutate)
-			_, err := ornith.InspectAssemblySources(context.Background(), p, source)
-			if !errors.Is(err, ornith.ErrAssembly) {
+			_, err := decoder.InspectAssemblySources(context.Background(), p, source)
+			if !errors.Is(err, decoder.ErrAssembly) {
 				t.Fatalf("tampered source:%v", err)
 			}
 			assertOnlyHeadersAndClosed(t, source)
@@ -407,7 +409,7 @@ func TestInspectionCancellationOpenErrorsAndTruncationReleaseSources(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	source := provider(t, p, nil)
-	if _, err := ornith.InspectAssemblySources(ctx, p, source); !errors.Is(err, context.Canceled) || source.opens != 0 {
+	if _, err := decoder.InspectAssemblySources(ctx, p, source); !errors.Is(err, context.Canceled) || source.opens != 0 {
 		t.Fatal("canceled inspection opened sources")
 	}
 	ctx, cancel = context.WithCancel(context.Background())
@@ -416,14 +418,14 @@ func TestInspectionCancellationOpenErrorsAndTruncationReleaseSources(t *testing.
 	for _, shard := range source.shards {
 		shard.afterRead = cancel
 	}
-	if _, err := ornith.InspectAssemblySources(ctx, p, source); !errors.Is(err, context.Canceled) {
+	if _, err := decoder.InspectAssemblySources(ctx, p, source); !errors.Is(err, context.Canceled) {
 		t.Fatalf("midheader cancellation:%v", err)
 	}
 	assertOnlyHeadersAndClosed(t, source)
 	marker := errors.New("provider failed")
 	source = provider(t, p, nil)
 	source.openErr = marker
-	if _, err := ornith.InspectAssemblySources(context.Background(), p, source); !errors.Is(err, marker) {
+	if _, err := decoder.InspectAssemblySources(context.Background(), p, source); !errors.Is(err, marker) {
 		t.Fatal(err)
 	}
 	if source.shards["model-00001-of-00004.safetensors"].closes != 1 {
@@ -431,13 +433,13 @@ func TestInspectionCancellationOpenErrorsAndTruncationReleaseSources(t *testing.
 	}
 	source = provider(t, p, nil)
 	source.shards["model-00001-of-00004.safetensors"].header = []byte{1, 2, 3}
-	if _, err := ornith.InspectAssemblySources(context.Background(), p, source); err == nil {
+	if _, err := decoder.InspectAssemblySources(context.Background(), p, source); err == nil {
 		t.Fatal("truncated header accepted")
 	}
 	assertOnlyHeadersAndClosed(t, source)
 	source = provider(t, p, nil)
 	source.shards["model-00001-of-00004.safetensors"].closeErr = marker
-	if _, err := ornith.InspectAssemblySources(context.Background(), p, source); !errors.Is(err, marker) {
+	if _, err := decoder.InspectAssemblySources(context.Background(), p, source); !errors.Is(err, marker) {
 		t.Fatal("provider close failure swallowed")
 	}
 	assertOnlyHeadersAndClosed(t, source)
@@ -445,17 +447,83 @@ func TestInspectionCancellationOpenErrorsAndTruncationReleaseSources(t *testing.
 
 func TestLoadRejectsPartialOrReorderedInitialSetWithoutOpeningShards(t *testing.T) {
 	p := plan(t, fixture())
-	for _, initial := range []*ornith.InitialAdapter{nil, {SHA256: initialDigest, Parameters: make([]ornith.InitialParameter, 31)}, {SHA256: initialDigest, Parameters: make([]ornith.InitialParameter, 32)}} {
+	for _, initial := range []*decoder.InitialAdapter{nil, {SHA256: initialDigest, Parameters: make([]decoder.InitialParameter, 31)}, {SHA256: initialDigest, Parameters: make([]decoder.InitialParameter, 32)}} {
 		source := provider(t, p, nil)
-		result, err := ornith.LoadTextAssembly(context.Background(), p, source, initial)
-		if result != nil || !errors.Is(err, ornith.ErrAssembly) || source.opens != 0 {
+		result, err := decoder.LoadTextAssembly(context.Background(), p, source, initial)
+		if result != nil || !errors.Is(err, decoder.ErrAssembly) || source.opens != 0 {
 			t.Fatalf("partial initial set reached shards:%v", err)
 		}
 	}
-	var empty *ornith.LoadedTextModel
+	var empty *decoder.LoadedTextModel
 	if err := empty.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 var _ io.ReaderAt = (*virtualShard)(nil)
+
+func fixturePlacement() []int {
+	devices := make([]int, 32)
+	for i := range devices {
+		devices[i] = i / 16
+	}
+	return devices
+}
+func (d documents) initialSHA() string {
+	if d.InitialSHA != "" {
+		return d.InitialSHA
+	}
+	return initialDigest
+}
+
+func TestAssemblyAdmitsDifferentGeometryAndThreeDevicePlacement(t *testing.T) {
+	d := fixture()
+	text := d.Config["text_config"].(map[string]any)
+	text["intermediate_size"] = 15360
+	limits := admittedLimits()
+	limits.PersistentBytes = []int64{20 << 30, 20 << 30, 20 << 30}
+	limits.DeviceByLayer = make([]int, 32)
+	for i := range limits.DeviceByLayer {
+		limits.DeviceByLayer[i] = i % 3
+	}
+	limits.OutputDevice = 2
+	for i := range d.Reference {
+		r := &d.Reference[i]
+		if strings.Contains(r.Name, ".mlp.") {
+			for j, dim := range r.Shape {
+				if dim == 12288 {
+					r.Shape[j] = 15360
+				}
+			}
+			r.Bytes = 2
+			for _, dim := range r.Shape {
+				r.Bytes *= dim
+			}
+		}
+		device := 0
+		var layer int
+		if _, err := fmt.Sscanf(r.Name, "base_model.model.model.language_model.layers.%d.", &layer); err == nil {
+			device = layer % 3
+		} else if r.Name == "base_model.model.lm_head.weight" || r.Name == "base_model.model.model.language_model.norm.weight" {
+			device = 2
+		}
+		r.Device = fmt.Sprintf("cuda:%d", device)
+	}
+	i, c, r, id := d.encode(t)
+	p, err := decoder.PlanTextAssembly(i, c, r, id, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Summary().PersistentBytes) != 3 || p.Summary().PersistentBytes[2] == 0 {
+		t.Fatal("third device was not admitted")
+	}
+	limits.DeviceByLayer[0] = 99
+	if p.Tensors()[1].Device.Index == 99 {
+		t.Fatal("caller mutated admitted placement")
+	}
+	summary := p.Summary()
+	summary.PersistentBytes[0] = 0
+	if p.Summary().PersistentBytes[0] == 0 {
+		t.Fatal("summary exposes mutable plan")
+	}
+}

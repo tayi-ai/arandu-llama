@@ -114,7 +114,7 @@ func LoRALinear(x, weight, a, b *torch.Tensor, alpha float64) (*torch.Tensor, er
 	return s.result(result)
 }
 
-// RMSNorm implements the unconverted Qwen3.5 checkpoint convention: learned
+// RMSNorm implements the unconverted hybrid decoder checkpoint convention: learned
 // weight is an offset, so the normalized value is multiplied by (1 + weight).
 // Reductions use Float32 and the result returns to the input dtype.
 func RMSNorm(x, weight *torch.Tensor, epsilon float64) (*torch.Tensor, error) {
@@ -200,7 +200,7 @@ func FeedForward(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tens
 }
 
 // FeedForwardPromoted computes SwiGLU in Float32 while leaving frozen Float16
-// checkpoint weights unchanged. Qwen3.5 checkpoints are BFloat16; this keeps
+// checkpoint weights unchanged. hybrid decoder checkpoints are BFloat16; this keeps
 // their exponent range on Turing devices, where native BFloat16 execution is
 // unavailable, without changing the admitted Float16 residual checkpoints.
 func FeedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tensor, error) {

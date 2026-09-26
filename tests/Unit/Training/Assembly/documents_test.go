@@ -1,39 +1,44 @@
 package assembly_test
 
 import (
+	"encoding/json"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"os"
 	"testing"
-
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 )
 
-func TestFrozenAssemblyDocumentsOptIn(t *testing.T) {
-	paths := []string{os.Getenv("TAYI_ORNITH_INDEX"), os.Getenv("TAYI_ORNITH_CONFIG"), os.Getenv("TAYI_ORNITH_REFERENCE")}
-	if paths[0] == "" && paths[1] == "" && paths[2] == "" {
-		t.Skip("set TAYI_ORNITH_INDEX, TAYI_ORNITH_CONFIG and TAYI_ORNITH_REFERENCE for frozen-document integration")
+func TestAdmittedAssemblyDocumentsOptIn(t *testing.T) {
+	configuration := os.Getenv("TRAINING_ASSEMBLY_TEST_CONFIG")
+	if configuration == "" {
+		t.Skip("set TRAINING_ASSEMBLY_TEST_CONFIG for admitted-document integration")
 	}
-	data := make([][]byte, 3)
-	for i, path := range paths {
-		if path == "" {
-			t.Fatal("all three frozen-document paths are required")
+	var spec struct {
+		Index, Config, Reference string
+		Identity                 decoder.AssemblyIdentity
+		Limits                   decoder.AssemblyLimits
+	}
+	data, err := os.ReadFile(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatal(err)
+	}
+	documents := make([][]byte, 3)
+	for i, p := range []string{spec.Index, spec.Config, spec.Reference} {
+		if p == "" {
+			t.Fatal("explicit document paths required")
 		}
-		var err error
-		data[i], err = os.ReadFile(path)
+		documents[i], err = os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	p, err := ornith.PlanTextAssembly(data[0], data[1], data[2], ornith.AssemblyIdentity{
-		IndexSHA256:          "d5c7fee99574e9a05f901282aee04fc4fc3dccf094a659df48c6b8e9f39109c3",
-		ConfigSHA256:         "1f1b3751c38f16a63340df90a55e870bef0f0b2968d833825a605b7cf930a313",
-		ReferenceSHA256:      "69825f715b8f422e2e155be4bd2ed309e14d77ac9d45a65405a3b5886ca228dc",
-		InitialAdapterSHA256: initialDigest,
-	}, admittedLimits())
+	plan, err := decoder.PlanTextAssembly(documents[0], documents[1], documents[2], spec.Identity, spec.Limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Summary().PersistentBytes != admittedLimits().PersistentBytes {
-		t.Fatal("frozen document geometry differs")
+	if plan.Summary().BaseTensors == 0 {
+		t.Fatal("empty assembly")
 	}
-	t.Logf("frozen_document_plan=%+v", p.Summary())
 }

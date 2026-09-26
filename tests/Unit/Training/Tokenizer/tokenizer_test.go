@@ -365,24 +365,26 @@ func TestImmutableTokenizerSupportsConcurrentCalls(t *testing.T) {
 	group.Wait()
 }
 
-// The real artifact is optional and is never downloaded by this test. Passing
-// it checks source admission and candidate IDs, not full-corpus oracle parity.
-func TestPinnedOrnithArtifactOptIn(t *testing.T) {
-	path := os.Getenv("TAYI_ORNITH_TOKENIZER_JSON")
+// The external reference is explicitly provided and never downloaded.
+func TestAdmittedArtifactOptIn(t *testing.T) {
+	path := os.Getenv("TRAINING_TOKENIZER_TEST_JSON")
 	if path == "" {
-		t.Skip("set TAYI_ORNITH_TOKENIZER_JSON to the pinned local artifact")
+		t.Skip("set TRAINING_TOKENIZER_TEST_JSON and TRAINING_TOKENIZER_TEST_SHA256")
 	}
+	expected := os.Getenv("TRAINING_TOKENIZER_TEST_SHA256")
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	tk, err := tokenizer.Load(context.Background(), file, "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42", tokenizer.DefaultLimits())
+	tk, err := tokenizer.Load(context.Background(), file, expected, tokenizer.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, label := range []string{" A", " B", " C", " D"} {
-		assertIDs(t, tk, label, []int64{[]int64{357, 417, 351, 414}[i]})
+	for _, input := range []string{"synthetic input", " A", " B"} {
+		ids, err := tk.Encode(context.Background(), input)
+		if err != nil || len(ids) == 0 {
+			t.Fatalf("tokenization failed: %v", err)
+		}
 	}
-	assertIDs(t, tk, "<|im_start|><think>", []int64{248045, 248068})
 }

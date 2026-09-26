@@ -1,4 +1,4 @@
-// Package tokenizer encodes raw text using the explicitly admitted Ornith BPE
+// Package tokenizer encodes raw text using the explicitly admitted Decoder BPE
 // schema. It does not apply a chat template or insert BOS/EOS tokens.
 // The pinned Go 1.27 and x/text tables use Unicode 17 for classification and NFC.
 // Compatibility with Hugging Face Tokenizers requires corpus qualification;

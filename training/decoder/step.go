@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 )
 
 // ErrCandidateStep identifies invalid candidate scoring or gradient data.
-var ErrCandidateStep = errors.New("ornith: candidate calculation rejected")
+var ErrCandidateStep = errors.New("decoder: candidate calculation rejected")
 
 // LossGradient maps four raw candidate logits to their four derivatives. The
 // caller owns the loss, target, scaling and numerical policy. The callback must
@@ -29,8 +29,7 @@ type CandidateParameterGradient struct {
 
 // CandidateGradientResult contains observed raw logits and ordered parameter
 // derivatives. It contains no native handles or optimizer updates. Names follow
-// model layer order, q/v projection, then A/B; tiny fixtures can have fewer than
-// the fixed model's 32 parameter tensors.
+// model layer order, q/v projection, then A/B; registry size is caller-owned.
 type CandidateGradientResult struct {
 	Logits    [4]float64
 	Gradients []CandidateParameterGradient

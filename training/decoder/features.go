@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 )
 
 // ErrFeatureTarget identifies invalid projected hidden-state supervision.
-var ErrFeatureTarget = errors.New("ornith: feature target rejected")
+var ErrFeatureTarget = errors.New("decoder: feature target rejected")
 
 // FeatureTarget is one immutable teacher vector already projected into the
 // student's hidden width. Layer is the zero-based decoder whose output is

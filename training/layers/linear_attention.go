@@ -13,7 +13,7 @@ import (
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-// LinearAttentionWeights contains unconverted, frozen Qwen3.5 checkpoint
+// LinearAttentionWeights contains unconverted, frozen hybrid decoder checkpoint
 // tensors. Projections use [out,in]. Convolution is [2*Hk*K+Hv*V,1,4],
 // ALog and DTBias are [Hv], and Norm is [V] (a direct multiplier, not 1+w).
 type LinearAttentionWeights struct {
@@ -43,7 +43,7 @@ type linearAttentionGeometry struct {
 	device                                                       torch.Device
 }
 
-// ForwardLinearAttention computes the complete causal, bias-free Qwen3.5
+// ForwardLinearAttention computes the complete causal, bias-free hybrid decoder
 // linear-attention block in FP32, starting from zero convolution and GDN state.
 // x is [B,T,D]; all arguments are borrowed and immutable. The caller owns the
 // detached result. This block has no LoRA weights and no model-training claim.

@@ -1,13 +1,13 @@
 //go:build libtorch && cgo && darwin
 
-package ornith_test
+package decoder_test
 
 import (
 	"context"
 	"math"
 	"testing"
 
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
@@ -17,11 +17,11 @@ func TestMPSFullDecoderCompletionGradientMatchesCPU(t *testing.T) {
 	}
 	cpu := newFixture(t, torch.Float32)
 	metal := newFixtureOnDevice(t, torch.Float32, torch.MPSDevice())
-	cpuResult, err := ornith.CompletionGradient(context.Background(), cpu.model, cpu.tokens, 2, cpu.limits, 1)
+	cpuResult, err := decoder.CompletionGradient(context.Background(), cpu.model, cpu.tokens, 2, cpu.limits, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	metalResult, err := ornith.CompletionGradient(context.Background(), metal.model, metal.tokens, 2, metal.limits, 1)
+	metalResult, err := decoder.CompletionGradient(context.Background(), metal.model, metal.tokens, 2, metal.limits, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

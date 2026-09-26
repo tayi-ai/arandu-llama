@@ -1,16 +1,17 @@
 //go:build libtorch && cgo
 
-package ornith_test
+package decoder_test
 
 import (
 	"context"
 	"errors"
+	testfixture "github.com/tayi-ai/arandu-llama/tests/Unit/Training/Fixture"
 	"math"
 	"reflect"
 	"testing"
 
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/layers"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
@@ -24,8 +25,8 @@ func featureFixture(t *testing.T, storage torch.DType) *fixture {
 	return f
 }
 
-func featureTargets() []ornith.FeatureTarget {
-	return []ornith.FeatureTarget{
+func featureTargets() []decoder.FeatureTarget {
+	return []decoder.FeatureTarget{
 		{Source: "teacher-a", Layer: 2, Position: 0, Weight: 0.15, Values: []float32{0.8, -0.7, 0.4, 0.2}},
 		{Source: "teacher-a", Layer: 4, Position: 1, Weight: 0.6, Values: []float32{0.3, -0.9, 0.8, -0.4}},
 		{Source: "teacher-a", Layer: 7, Position: 2, Weight: 0.35, Values: []float32{-0.5, 0.6, -0.2, 0.9}},
@@ -35,7 +36,7 @@ func featureTargets() []ornith.FeatureTarget {
 
 // manualFeatureLoss runs decoders directly, outside Snapshot/VJPWithFeatures,
 // and scores their outputs in Go. It does not use the feature implementation.
-func manualFeatureLoss(t *testing.T, f *fixture, targets []ornith.FeatureTarget) float64 {
+func manualFeatureLoss(t *testing.T, f *fixture, targets []decoder.FeatureTarget) float64 {
 	t.Helper()
 	embedding := read(t, f.model.Embedding)
 	info, err := f.model.Embedding.Info()
@@ -82,9 +83,9 @@ func manualFeatureLoss(t *testing.T, f *fixture, targets []ornith.FeatureTarget)
 	return loss
 }
 
-func fusedFeatures(t *testing.T, f *fixture, features []ornith.FeatureTarget, scale float64) ornith.FusionCompletionResult {
+func fusedFeatures(t *testing.T, f *fixture, features []decoder.FeatureTarget, scale float64) decoder.FusionCompletionResult {
 	t.Helper()
-	result, err := ornith.FusionCompletionGradientWithFeatures(context.Background(), f.model, f.tokens, 1, f.limits, scale, nil, features)
+	result, err := decoder.FusionCompletionGradientWithFeatures(context.Background(), f.model, f.tokens, 1, f.limits, scale, nil, features)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +159,7 @@ func TestFeatureFusionMatchesIndependentLossAndCentralDifferences(t *testing.T) 
 
 func TestFeatureFusionZeroWeightsScaleAndLayerBoundary(t *testing.T) {
 	f := featureFixture(t, torch.Float32)
-	baseline, err := ornith.FusionCompletionGradient(context.Background(), f.model, f.tokens, 1, f.limits, 1, nil)
+	baseline, err := decoder.FusionCompletionGradient(context.Background(), f.model, f.tokens, 1, f.limits, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +170,7 @@ func TestFeatureFusionZeroWeightsScaleAndLayerBoundary(t *testing.T) {
 	if got := fusedFeatures(t, f, zero, 1); !reflect.DeepEqual(got, baseline) {
 		t.Fatal("zero-weight features changed loss or gradients")
 	}
-	intermediate := []ornith.FeatureTarget{featureTargets()[1]}
+	intermediate := []decoder.FeatureTarget{featureTargets()[1]}
 	result := fusedFeatures(t, f, intermediate, 1)
 	if result.Loss <= baseline.Loss {
 		t.Fatal("feature objective did not change the loss")
@@ -206,16 +207,16 @@ func TestFeatureFusionZeroWeightsScaleAndLayerBoundary(t *testing.T) {
 
 func TestFeatureFusionCombinesIndependentTeacherLogitsAndFeatures(t *testing.T) {
 	f := featureFixture(t, torch.Float32)
-	teachers := []ornith.FusionTeacher{{Name: "logit-teacher", Weight: 0.4, Positions: []ornith.FusionTeacherPosition{
-		{RetainedMass: 0.7, TopK: []ornith.FusionTokenProbability{{TokenID: 2, Probability: 0.3}, {TokenID: 4, Probability: 0.4}}},
-		{RetainedMass: 0.8, TopK: []ornith.FusionTokenProbability{{TokenID: 1, Probability: 0.3}, {TokenID: 3, Probability: 0.5}}},
+	teachers := []decoder.FusionTeacher{{Name: "logit-teacher", Weight: 0.4, Positions: []decoder.FusionTeacherPosition{
+		{RetainedMass: 0.7, TopK: []decoder.FusionTokenProbability{{TokenID: 2, Probability: 0.3}, {TokenID: 4, Probability: 0.4}}},
+		{RetainedMass: 0.8, TopK: []decoder.FusionTokenProbability{{TokenID: 1, Probability: 0.3}, {TokenID: 3, Probability: 0.5}}},
 	}}}
 	features := featureTargets()
-	baseline, err := ornith.FusionCompletionGradient(context.Background(), f.model, f.tokens, 1, f.limits, 1, teachers)
+	baseline, err := decoder.FusionCompletionGradient(context.Background(), f.model, f.tokens, 1, f.limits, 1, teachers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	combined, err := ornith.FusionCompletionGradientWithFeatures(context.Background(), f.model, f.tokens, 1, f.limits, 1, teachers, features)
+	combined, err := decoder.FusionCompletionGradientWithFeatures(context.Background(), f.model, f.tokens, 1, f.limits, 1, teachers, features)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,42 +242,42 @@ func TestFeatureTargetsRejectMalformedDataAndPreserveSnapshot(t *testing.T) {
 	snapshot := forward(t, f)
 	seed := tensor(t, values(18, 0.3, 0.7), []int64{1, 3, 6}, false)
 	valid := featureTargets()[1]
-	for name, mutate := range map[string]func(*ornith.FeatureTarget){
-		"missing source":     func(x *ornith.FeatureTarget) { x.Source = " " },
-		"negative layer":     func(x *ornith.FeatureTarget) { x.Layer = -1 },
-		"past final layer":   func(x *ornith.FeatureTarget) { x.Layer = 8 },
-		"negative position":  func(x *ornith.FeatureTarget) { x.Position = -1 },
-		"past final token":   func(x *ornith.FeatureTarget) { x.Position = 3 },
-		"wrong hidden width": func(x *ornith.FeatureTarget) { x.Values = []float32{1} },
-		"negative weight":    func(x *ornith.FeatureTarget) { x.Weight = -1 },
-		"NaN weight":         func(x *ornith.FeatureTarget) { x.Weight = math.NaN() },
-		"infinite weight":    func(x *ornith.FeatureTarget) { x.Weight = math.Inf(1) },
-		"nonfinite values":   func(x *ornith.FeatureTarget) { x.Values = []float32{1, 2, float32(math.Inf(1)), 4} },
-		"overflow":           func(x *ornith.FeatureTarget) { x.Weight = math.MaxFloat64 },
+	for name, mutate := range map[string]func(*decoder.FeatureTarget){
+		"missing source":     func(x *decoder.FeatureTarget) { x.Source = " " },
+		"negative layer":     func(x *decoder.FeatureTarget) { x.Layer = -1 },
+		"past final layer":   func(x *decoder.FeatureTarget) { x.Layer = 8 },
+		"negative position":  func(x *decoder.FeatureTarget) { x.Position = -1 },
+		"past final token":   func(x *decoder.FeatureTarget) { x.Position = 3 },
+		"wrong hidden width": func(x *decoder.FeatureTarget) { x.Values = []float32{1} },
+		"negative weight":    func(x *decoder.FeatureTarget) { x.Weight = -1 },
+		"NaN weight":         func(x *decoder.FeatureTarget) { x.Weight = math.NaN() },
+		"infinite weight":    func(x *decoder.FeatureTarget) { x.Weight = math.Inf(1) },
+		"nonfinite values":   func(x *decoder.FeatureTarget) { x.Values = []float32{1, 2, float32(math.Inf(1)), 4} },
+		"overflow":           func(x *decoder.FeatureTarget) { x.Weight = math.MaxFloat64 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			bad := valid
 			mutate(&bad)
-			gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []ornith.FeatureTarget{bad}, 1)
+			gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []decoder.FeatureTarget{bad}, 1)
 			_ = gradients.Close()
-			if !errors.Is(err, ornith.ErrFeatureTarget) || gradients != nil || loss != 0 {
+			if !errors.Is(err, decoder.ErrFeatureTarget) || gradients != nil || loss != 0 {
 				t.Fatalf("invalid target returned gradients=%d loss=%g err=%v", len(gradients), loss, err)
 			}
 		})
 	}
-	if gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []ornith.FeatureTarget{valid, valid}, 1); gradients != nil || loss != 0 || !errors.Is(err, ornith.ErrFeatureTarget) {
+	if gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []decoder.FeatureTarget{valid, valid}, 1); gradients != nil || loss != 0 || !errors.Is(err, decoder.ErrFeatureTarget) {
 		_ = gradients.Close()
 		t.Fatalf("duplicate target accepted: %v", err)
 	}
 	for _, scale := range []float64{0, -1, math.NaN(), math.Inf(1)} {
-		if gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, nil, scale); gradients != nil || loss != 0 || !errors.Is(err, ornith.ErrFeatureTarget) {
+		if gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, nil, scale); gradients != nil || loss != 0 || !errors.Is(err, decoder.ErrFeatureTarget) {
 			_ = gradients.Close()
 			t.Fatalf("invalid scale accepted: %v", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if gradients, _, err := f.model.VJPWithFeatures(ctx, snapshot, seed, []ornith.FeatureTarget{valid}, 1); gradients != nil || !errors.Is(err, context.Canceled) {
+	if gradients, _, err := f.model.VJPWithFeatures(ctx, snapshot, seed, []decoder.FeatureTarget{valid}, 1); gradients != nil || !errors.Is(err, context.Canceled) {
 		_ = gradients.Close()
 		t.Fatalf("canceled feature backward accepted: %v", err)
 	}
@@ -288,7 +289,7 @@ func TestFeatureTargetsRejectMalformedDataAndPreserveSnapshot(t *testing.T) {
 	// None of the errors consumes the snapshot. Repeated valid calls are equal.
 	var previous []float32
 	for i := 0; i < 3; i++ {
-		gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []ornith.FeatureTarget{valid}, 1)
+		gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, []decoder.FeatureTarget{valid}, 1)
 		if err != nil || loss <= 0 {
 			t.Fatalf("valid backward after failure: %v", err)
 		}
@@ -372,16 +373,14 @@ func TestFeatureVJPRejectsStaleParameterGeneration(t *testing.T) {
 	f := newFixture(t, torch.Float32)
 	snapshot := forward(t, f)
 	seed := tensor(t, f.seed, []int64{1, 2, 6}, false)
-	initial, err := ornith.InitializeAdapter(context.Background(), ornith.InitialAdapterSpec{
-		Seed: 83, PreludeBlocks: 24, ExpectedSHA256: "75185d68fcfdd09bb2dcb6dffe0902a35300f52d9fda716b408189991773aa7c",
-	})
+	initial, err := decoder.InitializeAdapter(context.Background(), testfixture.Spec(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer initial.Close()
-	loaded := &ornith.LoadedTextModel{Model: f.model, Parameters: append([]ornith.InitialParameter(nil), initial.Parameters...)}
+	loaded := &decoder.LoadedTextModel{Model: f.model, Parameters: append([]decoder.InitialParameter(nil), initial.Parameters...)}
 	defer loaded.Close()
-	tinyLayers := append([]ornith.Layer(nil), f.model.Layers...)
+	tinyLayers := append([]decoder.Layer(nil), f.model.Layers...)
 	var all []float32
 	for i, p := range initial.Parameters {
 		all = append(all, read(t, p.Value)...)
@@ -397,7 +396,7 @@ func TestFeatureVJPRejectsStaleParameterGeneration(t *testing.T) {
 	f.model.Layers = tinyLayers
 	gradients, loss, err := f.model.VJPWithFeatures(context.Background(), snapshot, seed, featureTargets(), 1)
 	_ = gradients.Close()
-	if !errors.Is(err, ornith.ErrStaleSnapshot) || gradients != nil || loss != 0 {
+	if !errors.Is(err, decoder.ErrStaleSnapshot) || gradients != nil || loss != 0 {
 		t.Fatalf("stale feature snapshot accepted: %v", err)
 	}
 }

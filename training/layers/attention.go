@@ -8,7 +8,7 @@ import (
 )
 
 // AttentionWeights contains the unconverted checkpoint tensors for a gated
-// Qwen3.5 full-attention block. Every base tensor must remain frozen.
+// hybrid decoder full-attention block. Every base tensor must remain frozen.
 type AttentionWeights struct {
 	Query, Key, Value, Output *torch.Tensor
 	QueryNorm, KeyNorm        *torch.Tensor

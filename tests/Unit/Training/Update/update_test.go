@@ -8,21 +8,20 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	testfixture "github.com/tayi-ai/arandu-llama/tests/Unit/Training/Fixture"
 	"math"
 	"slices"
 	"sync/atomic"
 	"testing"
 
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/layers"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-const initialDigest = "75185d68fcfdd09bb2dcb6dffe0902a35300f52d9fda716b408189991773aa7c"
-
 type fixture struct {
-	model   *ornith.LoadedTextModel
-	initial *ornith.InitialAdapter
+	model   *decoder.LoadedTextModel
+	initial *decoder.InitialAdapter
 	base    *torch.Tensor
 }
 
@@ -38,13 +37,13 @@ func native(t *testing.T, values []float32, shape []int64, grad bool) *torch.Ten
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	initial, err := ornith.InitializeAdapter(context.Background(), ornith.InitialAdapterSpec{Seed: 83, PreludeBlocks: 24, ExpectedSHA256: initialDigest})
+	initial, err := decoder.InitializeAdapter(context.Background(), testfixture.Spec(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	base := native(t, []float32{0.25}, []int64{1}, false)
-	m := &ornith.LoadedTextModel{Model: &ornith.TextModel{Layers: make([]ornith.Layer, 32), Embedding: base},
-		Parameters: slices.Clone(initial.Parameters), Summary: ornith.AssemblySummary{AdapterTensors: 32, AdapterElements: 557056}}
+	m := &decoder.LoadedTextModel{Model: &decoder.TextModel{Layers: make([]decoder.Layer, 32), Embedding: base},
+		Parameters: slices.Clone(initial.Parameters), Summary: decoder.AssemblySummary{AdapterTensors: 32, AdapterElements: 557056}}
 	for i := range m.Model.Layers {
 		m.Model.Layers[i].Device = torch.CPUDevice()
 	}
@@ -56,7 +55,7 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{model: m, initial: initial, base: base}
 }
 
-func flatten(t *testing.T, parameters []ornith.InitialParameter) []float32 {
+func flatten(t *testing.T, parameters []decoder.InitialParameter) []float32 {
 	t.Helper()
 	var result []float32
 	for _, parameter := range parameters {
@@ -69,7 +68,7 @@ func flatten(t *testing.T, parameters []ornith.InitialParameter) []float32 {
 	return result
 }
 
-func digest(t *testing.T, parameters []ornith.InitialParameter) string {
+func digest(t *testing.T, parameters []decoder.InitialParameter) string {
 	t.Helper()
 	h := sha256.New()
 	var encoded [4]byte
@@ -87,7 +86,7 @@ func digest(t *testing.T, parameters []ornith.InitialParameter) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func expectedDigest(t *testing.T, parameters []ornith.InitialParameter, values []float32) string {
+func expectedDigest(t *testing.T, parameters []decoder.InitialParameter, values []float32) string {
 	t.Helper()
 	h := sha256.New()
 	var encoded [4]byte
@@ -113,12 +112,12 @@ func expectedDigest(t *testing.T, parameters []ornith.InitialParameter, values [
 func TestReplaceParametersPreservesIdentityOwnershipAndFrozenBase(t *testing.T) {
 	f := newFixture(t)
 	values := flatten(t, f.model.Parameters)
-	if len(values) != 557056 || digest(t, f.model.Parameters) != initialDigest {
+	if len(values) != 557056 || digest(t, f.model.Parameters) != testfixture.Spec(t).ExpectedSHA256 {
 		t.Fatal("reference initializer differs")
 	}
 	old := slices.Clone(f.model.Parameters)
 	got, err := f.model.ReplaceParameters(context.Background(), values)
-	if err != nil || got != initialDigest {
+	if err != nil || got != testfixture.Spec(t).ExpectedSHA256 {
 		t.Fatalf("same-value installation digest=%s error=%v", got, err)
 	}
 	for _, parameter := range old {
@@ -133,7 +132,7 @@ func TestReplaceParametersPreservesIdentityOwnershipAndFrozenBase(t *testing.T) 
 	before := slices.Clone(values)
 	want := expectedDigest(t, old, values)
 	got, err = f.model.ReplaceParameters(context.Background(), values)
-	if err != nil || got != want || digest(t, f.model.Parameters) != want || got == initialDigest {
+	if err != nil || got != want || digest(t, f.model.Parameters) != want || got == testfixture.Spec(t).ExpectedSHA256 {
 		t.Fatalf("updated installation digest=%s want=%s error=%v", got, want, err)
 	}
 	observed := flatten(t, f.model.Parameters)
@@ -205,7 +204,7 @@ func TestRejectedReplacementLeavesAllOldTensorsAndReferencesIntact(t *testing.T)
 			case "extra adapter":
 				f.model.Model.Layers[0].Adapter = f.model.Model.Layers[3].Adapter
 			case "alpha":
-				f.model.Model.Layers[31].Adapter.Alpha = 7
+				f.model.Model.Layers[31].Adapter.Alpha = 0
 			case "shape":
 				value := native(t, make([]float32, 16384), []int64{4096, 4}, true)
 				f.model.Parameters[0].Value, f.model.Model.Layers[3].Adapter.QueryA = value, value
@@ -236,7 +235,7 @@ func TestRejectedReplacementLeavesAllOldTensorsAndReferencesIntact(t *testing.T)
 			before := digest(t, f.initial.Parameters)
 			refs := slices.Clone(f.model.Parameters)
 			got, err := f.model.ReplaceParameters(context.Background(), values)
-			if got != "" || !errors.Is(err, ornith.ErrParameters) {
+			if got != "" || !errors.Is(err, decoder.ErrParameters) {
 				t.Fatalf("digest=%s error=%v", got, err)
 			}
 			if digest(t, f.initial.Parameters) != before {
@@ -281,7 +280,7 @@ func TestCurrentOwnerRejectsForeignOrClosedParameter(t *testing.T) {
 			before := digest(t, unchanged)
 			refs := slices.Clone(f.model.Parameters)
 			got, err := f.model.ReplaceParameters(context.Background(), values)
-			if got != "" || !errors.Is(err, ornith.ErrParameters) {
+			if got != "" || !errors.Is(err, decoder.ErrParameters) {
 				t.Fatalf("ownership mismatch accepted: %s %v", got, err)
 			}
 			if digest(t, unchanged) != before {
@@ -345,7 +344,7 @@ func TestCancellationBeforeCommitRetainsExactOldGeneration(t *testing.T) {
 // only fixed registry is restored solely during replacement; no large base
 // checkpoint is allocated. Restoring the original tiny layer before VJP isolates
 // generation validation from the independent state-count and geometry checks.
-func tinySnapshot(t *testing.T, f *fixture) (*ornith.Snapshot, []ornith.Layer, *torch.Tensor) {
+func tinySnapshot(t *testing.T, f *fixture) (*decoder.Snapshot, []decoder.Layer, *torch.Tensor) {
 	t.Helper()
 	n := func(values []float32, shape ...int64) *torch.Tensor { return native(t, values, shape, false) }
 	model := f.model.Model
@@ -360,11 +359,11 @@ func tinySnapshot(t *testing.T, f *fixture) (*ornith.Snapshot, []ornith.Layer, *
 		Gate: n([]float32{0.1, 0.2, 0.2, -0.1}, 2, 2), Up: n([]float32{0.2, 0.1, -0.1, 0.2}, 2, 2), Down: n([]float32{0.1, 0.3, 0.2, -0.1}, 2, 2)}
 	adapter := &layers.AttentionLoRA{QueryA: native(t, []float32{0.1, 0.2}, []int64{1, 2}, true), QueryB: native(t, []float32{0.1, 0.2, -0.1, 0.3}, []int64{4, 1}, true),
 		ValueA: native(t, []float32{0.2, 0.1}, []int64{1, 2}, true), ValueB: native(t, []float32{0.1, -0.1}, []int64{2, 1}, true), Alpha: 2}
-	tiny := []ornith.Layer{{Device: torch.CPUDevice(), Weights: weights, Adapter: adapter, Cosine: n([]float32{1}, 1, 1), Sine: n([]float32{0}, 1, 1),
+	tiny := []decoder.Layer{{Device: torch.CPUDevice(), Weights: weights, Adapter: adapter, Cosine: n([]float32{1}, 1, 1), Sine: n([]float32{0}, 1, 1),
 		Config: layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: 2, Full: layers.AttentionConfig{Heads: 1, KVHeads: 1, HeadDimension: 2, RotaryDimension: 2, Epsilon: 1e-6, MaxScoreElements: 1}}}}
 	registry := model.Layers
 	model.Layers = tiny
-	snapshot, err := model.Forward(context.Background(), []int64{1}, ornith.Limits{MaxTokens: 1, LogitRows: 1, MaxCheckpointBytes: 24})
+	snapshot, err := model.Forward(context.Background(), []int64{1}, decoder.Limits{MaxTokens: 1, LogitRows: 1, MaxCheckpointBytes: 24})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +378,7 @@ func TestSuccessfulReplacementInvalidatesOlderSnapshotOnly(t *testing.T) {
 	values := flatten(t, f.model.Parameters)
 	bad := slices.Clone(values)
 	bad[0] = float32(math.NaN())
-	if _, err := f.model.ReplaceParameters(context.Background(), bad); !errors.Is(err, ornith.ErrParameters) {
+	if _, err := f.model.ReplaceParameters(context.Background(), bad); !errors.Is(err, decoder.ErrParameters) {
 		t.Fatal(err)
 	}
 	registry := f.model.Model.Layers
@@ -395,11 +394,11 @@ func TestSuccessfulReplacementInvalidatesOlderSnapshotOnly(t *testing.T) {
 	}
 	registry = f.model.Model.Layers
 	f.model.Model.Layers = tiny
-	if gradients, err := f.model.Model.VJP(context.Background(), snapshot, seed); gradients != nil || !errors.Is(err, ornith.ErrStaleSnapshot) {
+	if gradients, err := f.model.Model.VJP(context.Background(), snapshot, seed); gradients != nil || !errors.Is(err, decoder.ErrStaleSnapshot) {
 		_ = gradients.Close()
 		t.Fatalf("old generation accepted: %v", err)
 	}
-	fresh, err := f.model.Model.Forward(context.Background(), []int64{1}, ornith.Limits{MaxTokens: 1, LogitRows: 1, MaxCheckpointBytes: 24})
+	fresh, err := f.model.Model.Forward(context.Background(), []int64{1}, decoder.Limits{MaxTokens: 1, LogitRows: 1, MaxCheckpointBytes: 24})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,4 +409,22 @@ func TestSuccessfulReplacementInvalidatesOlderSnapshotOnly(t *testing.T) {
 	}
 	_ = gradients.Close()
 	f.model.Model.Layers = registry
+}
+
+func TestReplacementUsesSingleLayerShapeAndExplicitAlpha(t *testing.T) {
+	a := &layers.AttentionLoRA{QueryA: native(t, []float32{.1, .2}, []int64{1, 2}, true), QueryB: native(t, []float32{.3, .4, .5, .6}, []int64{4, 1}, true), ValueA: native(t, []float32{.7, .8}, []int64{1, 2}, true), ValueB: native(t, []float32{.9, 1}, []int64{2, 1}, true), Alpha: 3.5}
+	m := &decoder.LoadedTextModel{Model: &decoder.TextModel{Layers: []decoder.Layer{{Adapter: a, Device: torch.CPUDevice()}}}}
+	for i, value := range []*torch.Tensor{a.QueryA, a.QueryB, a.ValueA, a.ValueB} {
+		m.Parameters = append(m.Parameters, decoder.InitialParameter{Name: "base_model.model.model.language_model.layers.0.self_attn." + []string{"q_proj.lora_A.default.weight", "q_proj.lora_B.default.weight", "v_proj.lora_A.default.weight", "v_proj.lora_B.default.weight"}[i], Value: value})
+	}
+	defer m.Close()
+	vector := flatten(t, m.Parameters)
+	vector[0] += .01
+	got, err := m.ReplaceParameters(context.Background(), vector)
+	if err != nil || got == "" {
+		t.Fatalf("single layer replacement: %v", err)
+	}
+	if m.Model.Layers[0].Adapter.Alpha != 3.5 || len(m.Parameters) != 4 {
+		t.Fatal("replacement changed admitted geometry or scale")
+	}
 }

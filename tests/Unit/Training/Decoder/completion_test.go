@@ -1,6 +1,6 @@
 //go:build libtorch && cgo
 
-package ornith_test
+package decoder_test
 
 import (
 	"context"
@@ -8,11 +8,11 @@ import (
 	"math"
 	"testing"
 
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-func manualCompletionLoss(t *testing.T, f *fixture, prompt int, limits ornith.Limits) float64 {
+func manualCompletionLoss(t *testing.T, f *fixture, prompt int, limits decoder.Limits) float64 {
 	t.Helper()
 	snapshot, err := f.model.Forward(context.Background(), f.tokens, limits)
 	if err != nil {
@@ -50,7 +50,7 @@ func TestCompletionGradientMatchesShiftedMeanCrossEntropy(t *testing.T) {
 	limits.LogitRows = 3
 	want := manualCompletionLoss(t, f, 1, limits)
 
-	result, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 1)
+	result, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestCompletionGradientMatchesShiftedMeanCrossEntropy(t *testing.T) {
 	if baseHash(t, f) != before {
 		t.Fatal("completion gradient changed frozen base")
 	}
-	scaled, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 2)
+	scaled, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,21 +144,21 @@ func TestCompletionGradientRejectsInvalidMaskScaleAndCancellation(t *testing.T) 
 	limits.LogitRows = 3
 	for name, call := range map[string]func() error{
 		"empty prompt": func() error {
-			_, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, 0, limits, 1)
+			_, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, 0, limits, 1)
 			return err
 		},
 		"empty completion": func() error {
-			_, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, len(f.tokens), limits, 1)
+			_, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, len(f.tokens), limits, 1)
 			return err
 		},
 		"wrong logit rows": func() error {
 			wrong := limits
 			wrong.LogitRows = 2
-			_, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, 1, wrong, 1)
+			_, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, 1, wrong, 1)
 			return err
 		},
 		"zero loss scale": func() error {
-			_, err := ornith.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 0)
+			_, err := decoder.CompletionGradient(context.Background(), f.model, f.tokens, 1, limits, 0)
 			return err
 		},
 	} {
@@ -170,7 +170,7 @@ func TestCompletionGradientRejectsInvalidMaskScaleAndCancellation(t *testing.T) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result, err := ornith.CompletionGradient(ctx, f.model, f.tokens, 1, limits, 1)
+	result, err := decoder.CompletionGradient(ctx, f.model, f.tokens, 1, limits, 1)
 	if !errors.Is(err, context.Canceled) || result.Tokens != 0 || len(result.Gradients) != 0 {
 		t.Fatalf("canceled completion result=%+v err=%v", result, err)
 	}

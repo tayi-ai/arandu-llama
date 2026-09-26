@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-// FusionTokenProbability is one mapped teacher probability in the Ornith
+// FusionTokenProbability is one mapped teacher probability in the Decoder
 // vocabulary. Token IDs must already be mapped by the cache producer.
 type FusionTokenProbability struct {
 	TokenID     int64

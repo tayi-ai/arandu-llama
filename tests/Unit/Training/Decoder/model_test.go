@@ -1,6 +1,6 @@
 //go:build libtorch && cgo
 
-package ornith_test
+package decoder_test
 
 import (
 	"context"
@@ -13,17 +13,17 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/layers"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/sequence"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
 type fixture struct {
-	model  *ornith.TextModel
+	model  *decoder.TextModel
 	base   []*torch.Tensor
 	tokens []int64
-	limits ornith.Limits
+	limits decoder.Limits
 	seed   []float32
 }
 
@@ -65,7 +65,7 @@ func newFixture(t *testing.T, storage torch.DType) *fixture {
 
 func newFixtureOnDevice(t *testing.T, storage torch.DType, device torch.Device) *fixture {
 	t.Helper()
-	f := &fixture{tokens: []int64{1, 4, 2}, limits: ornith.Limits{MaxTokens: 3, LogitRows: 2, MaxCheckpointBytes: 1632}, seed: values(12, 0.3, 0.7)}
+	f := &fixture{tokens: []int64{1, 4, 2}, limits: decoder.Limits{MaxTokens: 3, LogitRows: 2, MaxCheckpointBytes: 1632}, seed: values(12, 0.3, 0.7)}
 	fixtureTensor := func(data []float32, shape []int64, grad bool) *torch.Tensor {
 		value, err := torch.FromFloat32(data, shape, device, grad)
 		return own(t, value, err)
@@ -105,9 +105,9 @@ func newFixtureOnDevice(t *testing.T, storage torch.DType, device torch.Device) 
 	}
 	cosine, sine := fixtureTensor(cos, []int64{3, 1}, false), fixtureTensor(sin, []int64{3, 1}, false)
 	f.base = append(f.base, cosine, sine)
-	f.model = &ornith.TextModel{
+	f.model = &decoder.TextModel{
 		Embedding: base([]int64{6, 4}, 0.2, 0.4, true), FinalNorm: base([]int64{4}, 0.3, 0.02, true), Head: base([]int64{6, 4}, 0.7, 0.3, true),
-		Epsilon: 1e-6, Layers: make([]ornith.Layer, 32),
+		Epsilon: 1e-6, Layers: make([]decoder.Layer, 32),
 	}
 	config := layers.DecoderConfig{
 		Epsilon: 1e-6, MaxInputElements: 12,
@@ -116,7 +116,7 @@ func newFixtureOnDevice(t *testing.T, storage torch.DType, device torch.Device) 
 			Sequence: sequence.SequenceLimits{ChunkTokens: 2, MaxTokens: 3, MaxOwnedElements: 1 << 20}},
 	}
 	for index := range f.model.Layers {
-		layer := ornith.Layer{Weights: shared, Config: config, Device: device}
+		layer := decoder.Layer{Weights: shared, Config: config, Device: device}
 		if index%4 == 3 {
 			layer.Weights.Full = full
 			layer.Cosine, layer.Sine = cosine, sine
@@ -160,7 +160,7 @@ func baseHash(t *testing.T, f *fixture) [32]byte {
 	return result
 }
 
-func forward(t *testing.T, f *fixture) *ornith.Snapshot {
+func forward(t *testing.T, f *fixture) *decoder.Snapshot {
 	t.Helper()
 	snapshot, err := f.model.Forward(context.Background(), f.tokens, f.limits)
 	if err != nil {
@@ -170,7 +170,7 @@ func forward(t *testing.T, f *fixture) *ornith.Snapshot {
 	return snapshot
 }
 
-func backward(t *testing.T, f *fixture, snapshot *ornith.Snapshot) ornith.Gradients {
+func backward(t *testing.T, f *fixture, snapshot *decoder.Snapshot) decoder.Gradients {
 	t.Helper()
 	seed := tensor(t, f.seed, []int64{1, 2, 6}, false)
 	gradients, err := f.model.VJP(context.Background(), snapshot, seed)
@@ -369,12 +369,12 @@ func TestFirstAndLastAdaptersMatchFreshForwardCentralDifferences(t *testing.T) {
 func TestCheckpointAdmissionSnapshotOwnershipAndMissingAdapters(t *testing.T) {
 	f := newFixture(t, torch.Float32)
 	before := baseHash(t, f)
-	for name, change := range map[string]func(*ornith.Limits){
-		"one byte below exact boundary": func(l *ornith.Limits) { l.MaxCheckpointBytes = 1631 },
-		"zero bytes":                    func(l *ornith.Limits) { l.MaxCheckpointBytes = 0 },
-		"token limit":                   func(l *ornith.Limits) { l.MaxTokens = 2 },
-		"too many output rows":          func(l *ornith.Limits) { l.LogitRows = 4 },
-		"no output rows":                func(l *ornith.Limits) { l.LogitRows = 0 },
+	for name, change := range map[string]func(*decoder.Limits){
+		"one byte below exact boundary": func(l *decoder.Limits) { l.MaxCheckpointBytes = 1631 },
+		"zero bytes":                    func(l *decoder.Limits) { l.MaxCheckpointBytes = 0 },
+		"token limit":                   func(l *decoder.Limits) { l.MaxTokens = 2 },
+		"too many output rows":          func(l *decoder.Limits) { l.LogitRows = 4 },
+		"no output rows":                func(l *decoder.Limits) { l.LogitRows = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			limits := f.limits

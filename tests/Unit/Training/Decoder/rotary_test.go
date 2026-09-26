@@ -1,23 +1,36 @@
 //go:build libtorch && cgo
 
-package ornith_test
+package decoder_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/tayi-ai/arandu-llama/training/ornith"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-const referenceFrequencySHA256 = "ec4437c15ead01576c3e6c7412c11daba363d17cee8bfce5c5d1c54e2e09d2d0"
+var referenceFrequencySHA256 = func() string {
+	var raw [16]byte
+	for i, v := range []float32{1, .25, .0625, .015625} {
+		binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(v))
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw[:]))
+}()
+
+func rotarySpec(digest string) decoder.RotarySpec {
+	return decoder.RotarySpec{Theta: 256, Dimension: 8, MaxTokens: 4096, HalfPrecision: true, ExpectedSHA256: digest}
+}
 
 func TestTextRotaryAdmitsExactReferenceFrequencyHash(t *testing.T) {
-	rotary, err := ornith.TextRotary(context.Background(), 3, torch.CPUDevice(), referenceFrequencySHA256)
+	rotary, err := decoder.TextRotary(context.Background(), 3, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +40,7 @@ func TestTextRotaryAdmitsExactReferenceFrequencyHash(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.DType != torch.Float32 || info.Device != torch.CPUDevice() || info.RequiresGrad || len(info.Shape) != 2 || info.Shape[0] != 3 || info.Shape[1] != 32 {
+		if info.DType != torch.Float32 || info.Device != torch.CPUDevice() || info.RequiresGrad || len(info.Shape) != 2 || info.Shape[0] != 3 || info.Shape[1] != 4 {
 			t.Fatalf("unexpected rotary metadata: %+v", info)
 		}
 		finite, err := value.AllFinite()
@@ -64,7 +77,7 @@ func rotaryRead(t *testing.T, value *torch.Tensor) []float32 {
 
 func TestTextRotaryMatchesIndependentScalarMathAndHalfRounding(t *testing.T) {
 	const tokens = 9
-	rotary, err := ornith.TextRotary(context.Background(), tokens, torch.CPUDevice(), referenceFrequencySHA256)
+	rotary, err := decoder.TextRotary(context.Background(), tokens, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,18 +86,18 @@ func TestTextRotaryMatchesIndependentScalarMathAndHalfRounding(t *testing.T) {
 	var maximumHalfULP float64
 	roundedEntries := 0
 	for position := 0; position < tokens; position++ {
-		for column := 0; column < 32; column++ {
+		for column := 0; column < 4; column++ {
 			// HF uses FP32 powers followed by an FP32 reciprocal. Go's math.Pow
 			// supplies an independent scalar implementation; native pow/trig
 			// may differ by a small ULP before rounding to the storage dtype.
-			power := float32(math.Pow(10000000, float64(column)/32))
+			power := float32(math.Pow(256, float64(column)/4))
 			frequency := float32(1) / power
 			angle := float32(position) * frequency
 			for _, entry := range []struct {
 				got, raw float32
 			}{
-				{cosine[position*32+column], float32(math.Cos(float64(angle)))},
-				{sine[position*32+column], float32(math.Sin(float64(angle)))},
+				{cosine[position*4+column], float32(math.Cos(float64(angle)))},
+				{sine[position*4+column], float32(math.Sin(float64(angle)))},
 			} {
 				expected := rotaryHalfRound(entry.raw)
 				if rotaryHalfRound(entry.got) != entry.got {
@@ -104,23 +117,23 @@ func TestTextRotaryMatchesIndependentScalarMathAndHalfRounding(t *testing.T) {
 	if roundedEntries == 0 {
 		t.Fatal("fixture never distinguished FP32 from FP16 storage")
 	}
-	for column := 0; column < 32; column++ {
+	for column := 0; column < 4; column++ {
 		if cosine[column] != 1 || math.Float32bits(sine[column]) != 0 {
 			t.Fatal("position zero must be cosine one and positive-zero sine")
 		}
 	}
-	t.Logf("576 scalar comparisons; max error %.4g half ULP; %d entries exercise FP16 rounding", maximumHalfULP, roundedEntries)
+	t.Logf("72 scalar comparisons; max error %.4g half ULP; %d entries exercise FP16 rounding", maximumHalfULP, roundedEntries)
 }
 
 func TestTextRotaryMaximumTokensHaveSequentialPositionsAndBoundedTables(t *testing.T) {
-	rotary, err := ornith.TextRotary(context.Background(), 4096, torch.CPUDevice(), referenceFrequencySHA256)
+	rotary, err := decoder.TextRotary(context.Background(), 4096, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rotary.Close()
 	for _, value := range []*torch.Tensor{rotary.Cosine, rotary.Sine} {
 		info, err := value.Info()
-		if err != nil || len(info.Shape) != 2 || info.Shape[0] != 4096 || info.Shape[1] != 32 || info.Elements != 4096*32 {
+		if err != nil || len(info.Shape) != 2 || info.Shape[0] != 4096 || info.Shape[1] != 4 || info.Elements != 4096*4 {
 			t.Fatalf("maximum-length table geometry differs: %+v %v", info, err)
 		}
 		finite, err := value.AllFinite()
@@ -133,8 +146,8 @@ func TestTextRotaryMaximumTokensHaveSequentialPositionsAndBoundedTables(t *testi
 		// The first inverse frequency is exactly one, making this a direct
 		// check of every text position and the table axes, without pow error.
 		for _, entry := range []struct{ got, expected float32 }{
-			{cosine[position*32], rotaryHalfRound(float32(math.Cos(float64(position))))},
-			{sine[position*32], rotaryHalfRound(float32(math.Sin(float64(position))))},
+			{cosine[position*4], rotaryHalfRound(float32(math.Cos(float64(position))))},
+			{sine[position*4], rotaryHalfRound(float32(math.Sin(float64(position))))},
 		} {
 			if math.Abs(float64(entry.got)-float64(entry.expected)) > rotaryHalfStep(entry.expected) {
 				t.Fatalf("position%d is not the expected sequential text position", position)
@@ -145,15 +158,15 @@ func TestTextRotaryMaximumTokensHaveSequentialPositionsAndBoundedTables(t *testi
 
 func TestTextRotaryRejectsInvalidLimitsIdentityAndDevice(t *testing.T) {
 	for _, tokens := range []int{-1, 0, 4097, int(^uint(0) >> 1)} {
-		result, err := ornith.TextRotary(context.Background(), tokens, torch.CPUDevice(), referenceFrequencySHA256)
-		if result != nil || !errors.Is(err, ornith.ErrRotarySpec) {
+		result, err := decoder.TextRotary(context.Background(), tokens, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
+		if result != nil || !errors.Is(err, decoder.ErrRotarySpec) {
 			_ = result.Close()
 			t.Fatalf("invalid tokens%d: %v", tokens, err)
 		}
 	}
 	for _, digest := range []string{"", referenceFrequencySHA256[:63], strings.Repeat("g", 64), strings.ToUpper(referenceFrequencySHA256)} {
-		result, err := ornith.TextRotary(context.Background(), 3, torch.CPUDevice(), digest)
-		if result != nil || !errors.Is(err, ornith.ErrRotarySpec) {
+		result, err := decoder.TextRotary(context.Background(), 3, torch.CPUDevice(), rotarySpec(digest))
+		if result != nil || !errors.Is(err, decoder.ErrRotarySpec) {
 			_ = result.Close()
 			t.Fatalf("invalid digest accepted: %v", err)
 		}
@@ -161,18 +174,18 @@ func TestTextRotaryRejectsInvalidLimitsIdentityAndDevice(t *testing.T) {
 	// Invalid target placement would produce a different error if reached:
 	// the frequency identity must be checked before target-device operations.
 	invalidDevice := torch.Device{Kind: "invalid", Index: 0}
-	result, err := ornith.TextRotary(context.Background(), 3, invalidDevice, strings.Repeat("0", 64))
-	if result != nil || !errors.Is(err, ornith.ErrRotaryIdentity) {
+	result, err := decoder.TextRotary(context.Background(), 3, invalidDevice, rotarySpec(strings.Repeat("0", 64)))
+	if result != nil || !errors.Is(err, decoder.ErrRotaryIdentity) {
 		_ = result.Close()
 		t.Fatalf("frequency guard did not precede target placement: %v", err)
 	}
-	result, err = ornith.TextRotary(context.Background(), 3, invalidDevice, referenceFrequencySHA256)
-	if result != nil || err == nil || errors.Is(err, ornith.ErrRotaryIdentity) {
+	result, err = decoder.TextRotary(context.Background(), 3, invalidDevice, rotarySpec(referenceFrequencySHA256))
+	if result != nil || err == nil || errors.Is(err, decoder.ErrRotaryIdentity) {
 		_ = result.Close()
 		t.Fatalf("invalid device admission: %v", err)
 	}
-	result, err = ornith.TextRotary(nil, 3, torch.CPUDevice(), referenceFrequencySHA256)
-	if result != nil || !errors.Is(err, ornith.ErrRotarySpec) {
+	result, err = decoder.TextRotary(nil, 3, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
+	if result != nil || !errors.Is(err, decoder.ErrRotarySpec) {
 		_ = result.Close()
 		t.Fatalf("nil context admission: %v", err)
 	}
@@ -195,7 +208,7 @@ func (c *rotaryCheckingContext) Err() error {
 func TestTextRotaryCancellationAndOwnedOutputLifetime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if result, err := ornith.TextRotary(ctx, 3, torch.CPUDevice(), referenceFrequencySHA256); result != nil || !errors.Is(err, context.Canceled) {
+	if result, err := decoder.TextRotary(ctx, 3, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256)); result != nil || !errors.Is(err, context.Canceled) {
 		_ = result.Close()
 		t.Fatalf("pre-canceled rotary: %v", err)
 	}
@@ -204,19 +217,19 @@ func TestTextRotaryCancellationAndOwnedOutputLifetime(t *testing.T) {
 	for _, threshold := range []int32{5, 19, 27, 29} {
 		ctx, cancel := context.WithCancel(context.Background())
 		checking := &rotaryCheckingContext{Context: ctx, cancel: cancel, threshold: threshold}
-		result, err := ornith.TextRotary(checking, 3, torch.CPUDevice(), referenceFrequencySHA256)
+		result, err := decoder.TextRotary(checking, 3, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 		cancel()
 		if result != nil || !errors.Is(err, context.Canceled) {
 			_ = result.Close()
 			t.Fatalf("mid-operation cancellation at%d: %v", threshold, err)
 		}
 	}
-	first, err := ornith.TextRotary(context.Background(), 1, torch.CPUDevice(), referenceFrequencySHA256)
+	first, err := decoder.TextRotary(context.Background(), 1, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := ornith.TextRotary(context.Background(), 1, torch.CPUDevice(), referenceFrequencySHA256)
+	second, err := decoder.TextRotary(context.Background(), 1, torch.CPUDevice(), rotarySpec(referenceFrequencySHA256))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +251,7 @@ func TestTextRotaryCancellationAndOwnedOutputLifetime(t *testing.T) {
 			t.Fatalf("independent output%d changed after closing first", index)
 		}
 	}
-	var absent *ornith.Rotary
+	var absent *decoder.Rotary
 	if err := absent.Close(); err != nil {
 		t.Fatal(err)
 	}

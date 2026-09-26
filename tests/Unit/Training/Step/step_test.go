@@ -11,18 +11,18 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/layers"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
 type tinyModel struct {
-	model      *ornith.TextModel
+	model      *decoder.TextModel
 	base       []*torch.Tensor
 	parameters []**torch.Tensor
 	prompt     []int64
 	candidates [4]int64
-	limits     ornith.Limits
+	limits     decoder.Limits
 }
 
 func pattern(size int, phase, scale float64) []float32 {
@@ -35,7 +35,7 @@ func pattern(size int, phase, scale float64) []float32 {
 
 func newTiny(t *testing.T) *tinyModel {
 	t.Helper()
-	f := &tinyModel{prompt: []int64{1, 4, 5}, candidates: [4]int64{5, 1, 4, 2}, limits: ornith.Limits{MaxTokens: 3, LogitRows: 2, MaxCheckpointBytes: 4096}}
+	f := &tinyModel{prompt: []int64{1, 4, 5}, candidates: [4]int64{5, 1, 4, 2}, limits: decoder.Limits{MaxTokens: 3, LogitRows: 2, MaxCheckpointBytes: 4096}}
 	makeTensor := func(data []float32, shape []int64, grad bool) *torch.Tensor {
 		value, err := torch.FromFloat32(data, shape, torch.CPUDevice(), grad)
 		if err != nil {
@@ -54,7 +54,7 @@ func newTiny(t *testing.T) *tinyModel {
 		}
 		return makeTensor(pattern(int(size), phase, scale), shape, false)
 	}
-	f.model = &ornith.TextModel{Embedding: base([]int64{6, 4}, .2, .4), FinalNorm: base([]int64{4}, .3, .02), Head: base([]int64{6, 4}, .7, .3), Layers: make([]ornith.Layer, 2), Epsilon: 1e-6}
+	f.model = &decoder.TextModel{Embedding: base([]int64{6, 4}, .2, .4), FinalNorm: base([]int64{4}, .3, .02), Head: base([]int64{6, 4}, .7, .3), Layers: make([]decoder.Layer, 2), Epsilon: 1e-6}
 	for i := range f.model.Layers {
 		phase := float64(i) * .8
 		weights := layers.DecoderWeights{InputNorm: base([]int64{4}, .1, .02), PostAttentionNorm: base([]int64{4}, .2, .02), Gate: base([]int64{5, 4}, .2, .1), Up: base([]int64{5, 4}, .6, .1), Down: base([]int64{4, 5}, .4, .1), Full: &layers.AttentionWeights{
@@ -66,7 +66,7 @@ func newTiny(t *testing.T) *tinyModel {
 			cosine[n] = float32(math.Cos(float64(n) * .3))
 			sine[n] = float32(math.Sin(float64(n) * .3))
 		}
-		f.model.Layers[i] = ornith.Layer{Weights: weights, Adapter: adapter, Device: torch.CPUDevice(), Cosine: makeTensor(cosine, []int64{3, 1}, false), Sine: makeTensor(sine, []int64{3, 1}, false), Config: layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: 12, Full: layers.AttentionConfig{Heads: 2, KVHeads: 1, HeadDimension: 2, RotaryDimension: 2, Epsilon: 1e-6, MaxScoreElements: 18}}}
+		f.model.Layers[i] = decoder.Layer{Weights: weights, Adapter: adapter, Device: torch.CPUDevice(), Cosine: makeTensor(cosine, []int64{3, 1}, false), Sine: makeTensor(sine, []int64{3, 1}, false), Config: layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: 12, Full: layers.AttentionConfig{Heads: 2, KVHeads: 1, HeadDimension: 2, RotaryDimension: 2, Epsilon: 1e-6, MaxScoreElements: 18}}}
 		f.parameters = append(f.parameters, &adapter.QueryA, &adapter.QueryB, &adapter.ValueA, &adapter.ValueB)
 	}
 	return f
@@ -105,7 +105,7 @@ func TestCandidateReadUsesPenultimateRowAndExplicitCandidateOrder(t *testing.T) 
 	f := newTiny(t)
 	before := frozenDigest(t, f)
 	raw := flatLogits(t, f)
-	got, err := ornith.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits)
+	got, err := decoder.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +119,14 @@ func TestCandidateReadUsesPenultimateRowAndExplicitCandidateOrder(t *testing.T) 
 	if lastDiff < 1e-3 {
 		t.Fatal("fixture does not distinguish penultimate and last positions")
 	}
-	again, err := ornith.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits)
+	again, err := decoder.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits)
 	if err != nil || again != got {
 		t.Fatalf("repeated score differs:%v", err)
 	}
 	for i := range f.model.Layers {
 		f.model.Layers[i].Adapter = nil
 	}
-	if _, err := ornith.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits); err != nil {
+	if _, err := decoder.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits); err != nil {
 		t.Fatalf("base-only scoring needs no optimizer:%v", err)
 	}
 	if frozenDigest(t, f) != before {
@@ -144,7 +144,7 @@ func TestCandidateGradientMatchesIndependentPenultimateFiniteDifferences(t *test
 	for i, id := range f.candidates {
 		observed[i] = float64(raw[id])
 	}
-	result, err := ornith.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, func(logits [4]float64) ([4]float64, error) {
+	result, err := decoder.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, func(logits [4]float64) ([4]float64, error) {
 		calls++
 		if logits != observed {
 			t.Fatal("callback received different logits")
@@ -235,9 +235,9 @@ func TestCandidateGradientMatchesIndependentPenultimateFiniteDifferences(t *test
 func TestCandidateCallbackOwnsScalingAndCanReturnZero(t *testing.T) {
 	f := newTiny(t)
 	gradient := [4]float64{.5, -.5, .25, -.25}
-	call := func(scale float64) ornith.CandidateGradientResult {
+	call := func(scale float64) decoder.CandidateGradientResult {
 		t.Helper()
-		result, err := ornith.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, func([4]float64) ([4]float64, error) {
+		result, err := decoder.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, func([4]float64) ([4]float64, error) {
 			g := gradient
 			for i := range g {
 				g[i] *= scale
@@ -268,27 +268,27 @@ func TestCandidateFailureRefusesPartialResultsAndPreservesModel(t *testing.T) {
 	marker := errors.New("caller derivative refused")
 	for _, test := range []struct {
 		name       string
-		derivative ornith.LossGradient
+		derivative decoder.LossGradient
 		expected   error
 	}{
 		{"callback_error", func([4]float64) ([4]float64, error) { return [4]float64{}, marker }, marker},
-		{"nan", func([4]float64) ([4]float64, error) { return [4]float64{math.NaN()}, nil }, ornith.ErrCandidateStep},
-		{"infinity", func([4]float64) ([4]float64, error) { return [4]float64{math.Inf(-1)}, nil }, ornith.ErrCandidateStep},
-		{"fp32_overflow", func([4]float64) ([4]float64, error) { return [4]float64{math.MaxFloat64}, nil }, ornith.ErrCandidateStep},
+		{"nan", func([4]float64) ([4]float64, error) { return [4]float64{math.NaN()}, nil }, decoder.ErrCandidateStep},
+		{"infinity", func([4]float64) ([4]float64, error) { return [4]float64{math.Inf(-1)}, nil }, decoder.ErrCandidateStep},
+		{"fp32_overflow", func([4]float64) ([4]float64, error) { return [4]float64{math.MaxFloat64}, nil }, decoder.ErrCandidateStep},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			result, err := ornith.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, test.derivative)
+			result, err := decoder.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, test.derivative)
 			if !errors.Is(err, test.expected) || len(result.Gradients) != 0 || result.Logits != [4]float64{} {
 				t.Fatalf("invalid derivative:%+v %v", result, err)
 			}
-			if _, err := ornith.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits); err != nil {
+			if _, err := decoder.ReadCandidateLogits(context.Background(), f.model, f.prompt, f.candidates, f.limits); err != nil {
 				t.Fatalf("failure invalidated model:%v", err)
 			}
 		})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	result, err := ornith.CandidateGradient(ctx, f.model, f.prompt, f.candidates, f.limits, func([4]float64) ([4]float64, error) { cancel(); return [4]float64{1}, nil })
+	result, err := decoder.CandidateGradient(ctx, f.model, f.prompt, f.candidates, f.limits, func([4]float64) ([4]float64, error) { cancel(); return [4]float64{1}, nil })
 	if !errors.Is(err, context.Canceled) || len(result.Gradients) != 0 || result.Logits != [4]float64{} {
 		t.Fatalf("callback cancellation:%+v %v", result, err)
 	}
@@ -316,13 +316,13 @@ func TestCandidateValidationRejectsAmbiguousScoringWindow(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			limits := f.limits
 			limits.LogitRows = test.rows
-			result, err := ornith.ReadCandidateLogits(context.Background(), f.model, test.prompt, test.ids, limits)
-			if !errors.Is(err, ornith.ErrCandidateStep) || result != [4]float64{} {
+			result, err := decoder.ReadCandidateLogits(context.Background(), f.model, test.prompt, test.ids, limits)
+			if !errors.Is(err, decoder.ErrCandidateStep) || result != [4]float64{} {
 				t.Fatalf("invalid window accepted:%v", err)
 			}
 		})
 	}
-	if _, err := ornith.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, nil); !errors.Is(err, ornith.ErrCandidateStep) {
+	if _, err := decoder.CandidateGradient(context.Background(), f.model, f.prompt, f.candidates, f.limits, nil); !errors.Is(err, decoder.ErrCandidateStep) {
 		t.Fatal("nil derivative accepted")
 	}
 }

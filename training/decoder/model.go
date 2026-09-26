@@ -1,6 +1,6 @@
-// Package ornith composes checkpointed text-model calculations from native
+// Package decoder composes checkpointed text-model calculations from native
 // primitives. It does not admit resources, control fleet jobs or qualify a model.
-package ornith
+package decoder
 
 import (
 	"context"
@@ -26,7 +26,7 @@ type Layer struct {
 
 // TextModel borrows a frozen token embedding, decoder stack and output head.
 // The loader owns all weights and adapters. This calculation can represent tiny
-// qualification fixtures; its shape is not proof of Ornith identity.
+// qualification fixtures; its shape is not proof of Decoder identity.
 // It is not goroutine-safe: the caller must serialize Forward, VJP, parameter
 // replacement and Close, and must not mutate borrowed tensors during a call.
 type TextModel struct {
@@ -37,7 +37,7 @@ type TextModel struct {
 }
 
 // ErrStaleSnapshot means parameter replacement invalidated a forward snapshot.
-var ErrStaleSnapshot = errors.New("ornith: forward snapshot uses an older parameter generation")
+var ErrStaleSnapshot = errors.New("decoder: forward snapshot uses an older parameter generation")
 
 // Limits bounds persistent activation payload, token count and output rows.
 // MaxCheckpointBytes covers decoder boundaries plus one transfer buffer only;
@@ -147,7 +147,7 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 		}
 		placed, err := current.To(layer.Device, info.DType)
 		if err != nil {
-			return nil, fmt.Errorf("ornith: layer %d input placement: %w", index, err)
+			return nil, fmt.Errorf("decoder: layer %d input placement: %w", index, err)
 		}
 		_ = current.Close()
 		snapshot.states = append(snapshot.states, placed)
@@ -156,7 +156,7 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 		}
 		current, err = layers.DecoderForward(ctx, placed, layer.Weights, layer.Adapter, layer.Cosine, layer.Sine, layer.Config)
 		if err != nil {
-			return nil, fmt.Errorf("ornith: layer %d forward: %w", index, err)
+			return nil, fmt.Errorf("decoder: layer %d forward: %w", index, err)
 		}
 		if err = observeForward(ctx, observer, StageAfterDecoder, index, current); err != nil {
 			return nil, err
@@ -181,7 +181,7 @@ func (m *TextModel) ForwardObserved(ctx context.Context, tokenIDs []int64, limit
 	}
 	finite, err := snapshot.Logits.AllFinite()
 	if err != nil || !finite {
-		return nil, errors.Join(errors.New("ornith: non-finite forward logits"), err)
+		return nil, errors.Join(errors.New("decoder: non-finite forward logits"), err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -198,7 +198,7 @@ func (m *TextModel) VJP(ctx context.Context, snapshot *Snapshot, logitCotangent 
 
 func (m *TextModel) validateSnapshot(ctx context.Context, snapshot *Snapshot, logitCotangent *torch.Tensor) error {
 	if ctx == nil || m == nil || snapshot == nil || snapshot.owner != m || len(snapshot.states) != len(m.Layers)+1 || logitCotangent == nil {
-		return errors.New("ornith: VJP requires this model's live forward snapshot and cotangent")
+		return errors.New("decoder: VJP requires this model's live forward snapshot and cotangent")
 	}
 	if snapshot.generation != m.generation {
 		return ErrStaleSnapshot
@@ -218,7 +218,7 @@ func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		}
 	}
 	if firstTrainable < 0 {
-		return nil, errors.New("ornith: model has no trainable adapters")
+		return nil, errors.New("decoder: model has no trainable adapters")
 	}
 	last, err := snapshot.states[len(m.Layers)].Detach()
 	if err != nil {
@@ -244,11 +244,11 @@ func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		return nil, err
 	}
 	if dInfo.DType != torch.Float32 || dInfo.Device != lInfo.Device || !sameShape(dInfo.Shape, lInfo.Shape) {
-		return nil, errors.New("ornith: logit cotangent geometry, dtype or placement differs")
+		return nil, errors.New("decoder: logit cotangent geometry, dtype or placement differs")
 	}
 	finite, err := logitCotangent.AllFinite()
 	if err != nil || !finite {
-		return nil, errors.Join(errors.New("ornith: non-finite logit cotangent"), err)
+		return nil, errors.Join(errors.New("decoder: non-finite logit cotangent"), err)
 	}
 	headGradients, err := torch.Grad([]*torch.Tensor{logits}, []*torch.Tensor{leaf}, []*torch.Tensor{logitCotangent}, false, false)
 	if err != nil {
@@ -281,14 +281,14 @@ func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		if rows := features[index]; len(rows) != 0 {
 			combined, err := addFeatureCotangents(ctx, current, rows)
 			if err != nil {
-				return nil, fmt.Errorf("ornith: layer %d feature cotangent: %w", index, err)
+				return nil, fmt.Errorf("decoder: layer %d feature cotangent: %w", index, err)
 			}
 			_ = current.Close()
 			current = combined
 		}
 		gradient, err := layers.DecoderVJP(ctx, state, layer.Weights, layer.Adapter, layer.Cosine, layer.Sine, current, layer.Config)
 		if err != nil {
-			return nil, fmt.Errorf("ornith: layer %d backward: %w", index, err)
+			return nil, fmt.Errorf("decoder: layer %d backward: %w", index, err)
 		}
 		byLayer[index] = gradient
 		_ = current.Close()
@@ -346,20 +346,20 @@ func (m *TextModel) headObserved(ctx context.Context, hidden *torch.Tensor, coun
 
 func (m *TextModel) validate(ctx context.Context, tokens []int64, limits Limits) (torch.Info, error) {
 	if ctx == nil || m == nil || m.Embedding == nil || m.Head == nil || m.FinalNorm == nil || len(m.Layers) == 0 {
-		return torch.Info{}, errors.New("ornith: incomplete text model")
+		return torch.Info{}, errors.New("decoder: incomplete text model")
 	}
 	if err := ctx.Err(); err != nil {
 		return torch.Info{}, err
 	}
 	if len(tokens) == 0 || limits.MaxTokens <= 0 || int64(len(tokens)) > limits.MaxTokens || limits.LogitRows <= 0 || limits.LogitRows > int64(len(tokens)) || limits.MaxCheckpointBytes <= 0 {
-		return torch.Info{}, errors.New("ornith: token or checkpoint limits invalid")
+		return torch.Info{}, errors.New("decoder: token or checkpoint limits invalid")
 	}
 	info, err := m.Embedding.Info()
 	if err != nil {
 		return torch.Info{}, err
 	}
 	if len(info.Shape) != 2 || info.Shape[0] <= 0 || info.Shape[1] <= 0 || info.RequiresGrad || (info.DType != torch.Float16 && info.DType != torch.Float32) {
-		return torch.Info{}, errors.New("ornith: token embedding must be frozen Float16 or Float32")
+		return torch.Info{}, errors.New("decoder: token embedding must be frozen Float16 or Float32")
 	}
 	bytes := int64(2)
 	if info.DType == torch.Float32 {
@@ -367,17 +367,17 @@ func (m *TextModel) validate(ctx context.Context, tokens []int64, limits Limits)
 	}
 	for _, dimension := range []int64{int64(len(tokens)), info.Shape[1], int64(len(m.Layers)) + 2} {
 		if bytes > limits.MaxCheckpointBytes/dimension {
-			return torch.Info{}, errors.New("ornith: activation checkpoint budget exceeded")
+			return torch.Info{}, errors.New("decoder: activation checkpoint budget exceeded")
 		}
 		bytes *= dimension
 	}
 	for _, id := range tokens {
 		if id < 0 || id >= info.Shape[0] {
-			return torch.Info{}, errors.New("ornith: token ID outside embedding vocabulary")
+			return torch.Info{}, errors.New("decoder: token ID outside embedding vocabulary")
 		}
 	}
 	if !(m.Epsilon > 0) || math.IsInf(m.Epsilon, 0) {
-		return torch.Info{}, errors.New("ornith: normalization epsilon invalid")
+		return torch.Info{}, errors.New("decoder: normalization epsilon invalid")
 	}
 	for _, expected := range []struct {
 		value *torch.Tensor
@@ -390,7 +390,7 @@ func (m *TextModel) validate(ctx context.Context, tokens []int64, limits Limits)
 			return torch.Info{}, err
 		}
 		if actual.RequiresGrad || actual.DType != info.DType || actual.Device != m.Layers[len(m.Layers)-1].Device || !sameShape(actual.Shape, expected.shape) {
-			return torch.Info{}, errors.New("ornith: frozen head or final norm geometry, dtype or device differs")
+			return torch.Info{}, errors.New("decoder: frozen head or final norm geometry, dtype or device differs")
 		}
 	}
 	return info, nil

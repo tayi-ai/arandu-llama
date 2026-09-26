@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/fusioncache"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/pipeline"
 )
 
@@ -272,14 +272,14 @@ func TestNativeBackendCannotBypassAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, typ := range []reflect.Type{reflect.TypeFor[pipeline.Signals](), reflect.TypeFor[ornith.TrainingBackend]()} {
+	for _, typ := range []reflect.Type{reflect.TypeFor[pipeline.Signals](), reflect.TypeFor[decoder.TrainingBackend]()} {
 		for i := 0; i < typ.NumField(); i++ {
 			if typ.Field(i).PkgPath == "" {
 				t.Fatalf("mutable exported bypass: %s.%s", typ.Name(), typ.Field(i).Name)
 			}
 		}
 	}
-	var zero ornith.TrainingBackend
+	var zero decoder.TrainingBackend
 	if _, err := zero.Objective(context.Background()); err == nil {
 		t.Fatal("zero backend admitted")
 	}
@@ -289,20 +289,20 @@ func TestNativeBackendCannotBypassAdmission(t *testing.T) {
 	if err := zero.Install(context.Background(), []float32{1}); err == nil {
 		t.Fatal("zero backend install admitted")
 	}
-	identity := ornith.AssemblyIdentity{IndexSHA256: strings.Repeat("1", 64), ConfigSHA256: strings.Repeat("2", 64), ReferenceSHA256: strings.Repeat("3", 64), InitialAdapterSHA256: strings.Repeat("4", 64)}
-	loaded := &ornith.LoadedTextModel{Model: &ornith.TextModel{}, Summary: ornith.AssemblySummary{Identity: identity}}
-	external := ornith.TrainingAdmission{Assembly: identity, Student: a.Student}
+	identity := decoder.AssemblyIdentity{IndexSHA256: strings.Repeat("1", 64), ConfigSHA256: strings.Repeat("2", 64), ReferenceSHA256: strings.Repeat("3", 64), InitialAdapterSHA256: strings.Repeat("4", 64)}
+	loaded := &decoder.LoadedTextModel{Model: &decoder.TextModel{}, Summary: decoder.AssemblySummary{Identity: identity}}
+	external := decoder.TrainingAdmission{Assembly: identity, Student: a.Student}
 	external.Assembly.ConfigSHA256 = strings.Repeat("5", 64)
-	_, err = ornith.NewTrainingBackend(loaded, signals, ornith.Limits{MaxTokens: 8, MaxCheckpointBytes: 1024}, nil, external)
+	_, err = decoder.NewTrainingBackend(loaded, signals, decoder.Limits{MaxTokens: 8, MaxCheckpointBytes: 1024}, nil, external)
 	if err == nil || !strings.Contains(err.Error(), "assembly or student") {
 		t.Fatalf("identity mismatch reached native geometry: %v", err)
 	}
 	external.Assembly = identity
 	external.Student.Revision = strings.Repeat("0", 40)
-	if _, err := ornith.NewTrainingBackend(loaded, signals, ornith.Limits{}, nil, external); err == nil || !strings.Contains(err.Error(), "assembly or student") {
+	if _, err := decoder.NewTrainingBackend(loaded, signals, decoder.Limits{}, nil, external); err == nil || !strings.Contains(err.Error(), "assembly or student") {
 		t.Fatalf("student mismatch reached native geometry: %v", err)
 	}
-	if _, err := ornith.NewTrainingBackend(loaded, &pipeline.Signals{}, ornith.Limits{}, nil, ornith.TrainingAdmission{Assembly: identity, Student: a.Student}); err == nil {
+	if _, err := decoder.NewTrainingBackend(loaded, &pipeline.Signals{}, decoder.Limits{}, nil, decoder.TrainingAdmission{Assembly: identity, Student: a.Student}); err == nil {
 		t.Fatal("zero signals admitted")
 	}
 }

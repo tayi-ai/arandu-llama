@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"math"

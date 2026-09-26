@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -21,7 +23,7 @@ import (
 )
 
 // ErrAssembly identifies invalid geometry, identities, placement or admission.
-var ErrAssembly = errors.New("ornith: text assembly rejected")
+var ErrAssembly = errors.New("decoder: text assembly rejected")
 
 // AssemblyIdentity contains mandatory caller-admitted identities. Document
 // hashes cover exact bytes, and InitialAdapterSHA256 uses name/content order.
@@ -38,14 +40,18 @@ type AssemblyIdentity struct {
 // tensors, activations, RoPE and kernel workspaces require separate admission.
 // All execution budgets are explicit; no sequence or attention defaults apply.
 type AssemblyLimits struct {
-	HeaderLimits       checkpoint.Limits
-	TensorCopyBytes    int64
-	PersistentBytes    [2]int64
-	HashChunkBytes     int
-	MaxInputElements   int64
-	MaxScoreElements   int64
-	MaxWorkingElements int64
-	Sequence           sequence.SequenceLimits
+	HeaderLimits                  checkpoint.Limits
+	TensorCopyBytes               int64
+	PersistentBytes               []int64
+	DeviceByLayer                 []int
+	EmbeddingDevice, OutputDevice int
+	AdapterRank                   int64
+	AdapterAlpha                  float64
+	HashChunkBytes                int
+	MaxInputElements              int64
+	MaxScoreElements              int64
+	MaxWorkingElements            int64
+	Sequence                      sequence.SequenceLimits
 }
 
 // AssemblyTensor specifies a checkpoint weight and its required final identity.
@@ -65,7 +71,7 @@ type AssemblyTensor struct {
 type AssemblySummary struct {
 	BaseTensors, AdapterTensors int
 	AdapterElements             int64
-	PersistentBytes             [2]int64
+	PersistentBytes             []int64
 	LocalMPSBytes               int64
 	Identity                    AssemblyIdentity
 }
@@ -78,6 +84,7 @@ type AssemblyPlan struct {
 	limits            AssemblyLimits
 	summary           AssemblySummary
 	localMPS          bool
+	geometry          TextGeometry
 }
 
 // Summary returns value-only counts, budgets and document identities.
@@ -85,7 +92,9 @@ func (p *AssemblyPlan) Summary() AssemblySummary {
 	if p == nil {
 		return AssemblySummary{}
 	}
-	return p.summary
+	result := p.summary
+	result.PersistentBytes = slices.Clone(result.PersistentBytes)
+	return result
 }
 
 // Tensors returns detached metadata copies in base-then-adapter loading order.
@@ -159,7 +168,7 @@ func (m *LoadedTextModel) Close() error {
 	return errors.Join(failures...)
 }
 
-// PlanTextAssembly validates exact document hashes, fixed Ornith geometry,
+// PlanTextAssembly validates exact document hashes, caller-admitted decoder geometry,
 // every required reference tensor and both persistent budgets before any source
 // is opened. No payload is read and no native backend is required by this call.
 func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity AssemblyIdentity, limits AssemblyLimits) (*AssemblyPlan, error) {
@@ -179,8 +188,12 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 	if err := validateAssemblyLimits(limits); err != nil {
 		return nil, err
 	}
-	if err := validateAssemblyConfig(configJSON); err != nil {
+	geometry, err := validateAssemblyConfig(configJSON)
+	if err != nil {
 		return nil, err
+	}
+	if len(limits.DeviceByLayer) != geometry.Layers {
+		return nil, fmt.Errorf("%w: placement must cover every layer", ErrAssembly)
 	}
 	var index struct {
 		WeightMap map[string]string `json:"weight_map"`
@@ -204,8 +217,10 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 		}
 		refs[row.Name] = row
 	}
-	p := &AssemblyPlan{limits: limits, summary: AssemblySummary{Identity: identity}}
-	p.weights, p.adapters = assemblyGeometry()
+	limits.PersistentBytes = slices.Clone(limits.PersistentBytes)
+	limits.DeviceByLayer = slices.Clone(limits.DeviceByLayer)
+	p := &AssemblyPlan{limits: limits, geometry: geometry, summary: AssemblySummary{Identity: identity, PersistentBytes: make([]int64, len(limits.PersistentBytes))}}
+	p.weights, p.adapters = assemblyGeometry(geometry, limits)
 	admittedNames := make(map[string]bool, len(p.weights)+len(p.adapters))
 	sourceNames := make(map[string]bool, len(p.weights))
 	for _, group := range [][]AssemblyTensor{p.weights, p.adapters} {
@@ -226,7 +241,13 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 				item.Shard = shard
 				sourceNames[item.SourceName] = true
 			}
+			if item.Bytes > math.MaxInt64-p.summary.PersistentBytes[item.Device.Index] {
+				return nil, fmt.Errorf("%w: persistent byte count overflow", ErrAssembly)
+			}
 			p.summary.PersistentBytes[item.Device.Index] += item.Bytes
+			if item.Trainable {
+				p.summary.AdapterElements += item.Bytes / 4
+			}
 			if item.Bytes > limits.TensorCopyBytes/3 {
 				return nil, fmt.Errorf("%w: tensor copy budget for %s", ErrAssembly, item.ReferenceName)
 			}
@@ -255,11 +276,11 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 			return nil, fmt.Errorf("%w: GPU %d persistent budget needs %d bytes", ErrAssembly, device, needed)
 		}
 	}
-	p.summary.BaseTensors, p.summary.AdapterTensors, p.summary.AdapterElements = len(p.weights), len(p.adapters), 557056
+	p.summary.BaseTensors, p.summary.AdapterTensors = len(p.weights), len(p.adapters)
 	return p, nil
 }
 
-// PlanLocalMPSAssembly retains the frozen two-CUDA reference validation and
+// PlanLocalMPSAssembly retains the admitted reference placement validation and
 // content hashes, then explicitly places the same tensors on one Apple device.
 // maxMPSBytes is a caller-admitted payload cap, not an available-memory probe;
 // activations, allocator overhead and system reserve need separate admission.
@@ -268,7 +289,13 @@ func PlanLocalMPSAssembly(indexJSON, configJSON, referenceJSON []byte, identity 
 	if err != nil {
 		return nil, err
 	}
-	needed := p.summary.PersistentBytes[0] + p.summary.PersistentBytes[1]
+	var needed int64
+	for _, size := range p.summary.PersistentBytes {
+		if size > math.MaxInt64-needed {
+			return nil, ErrAssembly
+		}
+		needed += size
+	}
 	if maxMPSBytes <= 0 || needed > maxMPSBytes {
 		return nil, fmt.Errorf("%w: local MPS persistent budget needs %d bytes", ErrAssembly, needed)
 	}
@@ -324,8 +351,8 @@ func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardPro
 		if countErr != nil {
 			return nil, countErr
 		}
-		if count != 2 {
-			return nil, fmt.Errorf("%w: exactly two visible CUDA devices required", ErrAssembly)
+		if count < len(plan.limits.PersistentBytes) {
+			return nil, fmt.Errorf("%w: admitted CUDA placement is unavailable", ErrAssembly)
 		}
 	}
 	sources, _, err := openAssemblySources(ctx, plan, provider)
@@ -333,7 +360,7 @@ func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardPro
 		return nil, errors.Join(err, closeAssemblySources(sources))
 	}
 	defer func() { err = errors.Join(err, closeAssemblySources(sources)) }()
-	result := &LoadedTextModel{Model: &TextModel{Layers: make([]Layer, 32), Epsilon: 1e-6}, Summary: plan.summary}
+	result := &LoadedTextModel{Model: &TextModel{Layers: make([]Layer, plan.geometry.Layers), Epsilon: plan.geometry.Epsilon}, Summary: plan.Summary()}
 	complete := false
 	defer func() {
 		if !complete || err != nil {
@@ -400,7 +427,7 @@ func LoadTextAssembly(ctx context.Context, plan *AssemblyPlan, provider ShardPro
 		result.Parameters = append(result.Parameters, InitialParameter{Name: spec.ReferenceName, Value: leaf})
 		result.Receipts = append(result.Receipts, AssemblyTensorReceipt{Name: spec.ReferenceName, SHA256: spec.SHA256})
 	}
-	wireAssembly(result.Model, values, plan.limits, plan.localMPS)
+	wireAssembly(result.Model, values, plan.geometry, plan.limits, plan.localMPS)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -424,7 +451,7 @@ type assemblyReference struct {
 	RequiresGrad bool    `json:"requires_grad"`
 }
 
-func assemblyGeometry() (weights, adapters []AssemblyTensor) {
+func assemblyGeometry(c TextGeometry, limits AssemblyLimits) (weights, adapters []AssemblyTensor) {
 	add := func(source string, shape []int64, dtype torch.DType, device int) {
 		ref := "base_model.model." + source
 		if strings.Contains(source, ".self_attn.q_proj.") || strings.Contains(source, ".self_attn.v_proj.") {
@@ -440,18 +467,18 @@ func assemblyGeometry() (weights, adapters []AssemblyTensor) {
 		}
 		weights = append(weights, AssemblyTensor{SourceName: source, ReferenceName: ref, Shape: shape, DType: dtype, Device: torch.CUDADevice(device), Bytes: count * width})
 	}
-	add("model.language_model.embed_tokens.weight", []int64{248320, 4096}, torch.Float16, 0)
-	for layer := 0; layer < 32; layer++ {
-		device := layer / 16
+	add("model.language_model.embed_tokens.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.EmbeddingDevice)
+	for layer := 0; layer < c.Layers; layer++ {
+		device := limits.DeviceByLayer[layer]
 		prefix := fmt.Sprintf("model.language_model.layers.%d.", layer)
-		if layer%4 == 3 {
+		if c.LayerTypes[layer] == "full_attention" {
 			for _, item := range []struct {
 				suffix string
 				shape  []int64
 			}{
-				{"q_proj.weight", []int64{8192, 4096}}, {"k_proj.weight", []int64{1024, 4096}},
-				{"v_proj.weight", []int64{1024, 4096}}, {"o_proj.weight", []int64{4096, 4096}},
-				{"q_norm.weight", []int64{256}}, {"k_norm.weight", []int64{256}},
+				{"q_proj.weight", []int64{2 * c.Heads * c.Dimension, c.Hidden}}, {"k_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}},
+				{"v_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}}, {"o_proj.weight", []int64{c.Hidden, c.Heads * c.Dimension}},
+				{"q_norm.weight", []int64{c.Dimension}}, {"k_norm.weight", []int64{c.Dimension}},
 			} {
 				add(prefix+"self_attn."+item.suffix, item.shape, torch.Float32, device)
 			}
@@ -459,8 +486,8 @@ func assemblyGeometry() (weights, adapters []AssemblyTensor) {
 				projection, letter string
 				shape              []int64
 			}{
-				{"q_proj", "A", []int64{4, 4096}}, {"q_proj", "B", []int64{8192, 4}},
-				{"v_proj", "A", []int64{4, 4096}}, {"v_proj", "B", []int64{1024, 4}},
+				{"q_proj", "A", []int64{limits.AdapterRank, c.Hidden}}, {"q_proj", "B", []int64{2 * c.Heads * c.Dimension, limits.AdapterRank}},
+				{"v_proj", "A", []int64{limits.AdapterRank, c.Hidden}}, {"v_proj", "B", []int64{c.KVHeads * c.Dimension, limits.AdapterRank}},
 			} {
 				name := "base_model.model." + prefix + "self_attn." + item.projection + ".lora_" + item.letter + ".default.weight"
 				adapters = append(adapters, AssemblyTensor{ReferenceName: name, Shape: item.shape, DType: torch.Float32, Device: torch.CUDADevice(device), Bytes: item.shape[0] * item.shape[1] * 4, Trainable: true})
@@ -470,10 +497,10 @@ func assemblyGeometry() (weights, adapters []AssemblyTensor) {
 				suffix string
 				shape  []int64
 			}{
-				{"dt_bias", []int64{32}}, {"A_log", []int64{32}}, {"conv1d.weight", []int64{8192, 1, 4}},
-				{"norm.weight", []int64{128}}, {"out_proj.weight", []int64{4096, 4096}},
-				{"in_proj_qkv.weight", []int64{8192, 4096}}, {"in_proj_z.weight", []int64{4096, 4096}},
-				{"in_proj_b.weight", []int64{32, 4096}}, {"in_proj_a.weight", []int64{32, 4096}},
+				{"dt_bias", []int64{c.VHeads}}, {"A_log", []int64{c.VHeads}}, {"conv1d.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, 1, c.Conv}},
+				{"norm.weight", []int64{c.VDimension}}, {"out_proj.weight", []int64{c.Hidden, c.VHeads * c.VDimension}},
+				{"in_proj_qkv.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, c.Hidden}}, {"in_proj_z.weight", []int64{c.VHeads * c.VDimension, c.Hidden}},
+				{"in_proj_b.weight", []int64{c.VHeads, c.Hidden}}, {"in_proj_a.weight", []int64{c.VHeads, c.Hidden}},
 			} {
 				add(prefix+"linear_attn."+item.suffix, item.shape, torch.Float32, device)
 			}
@@ -482,21 +509,31 @@ func assemblyGeometry() (weights, adapters []AssemblyTensor) {
 			suffix string
 			shape  []int64
 		}{
-			{"mlp.gate_proj.weight", []int64{12288, 4096}}, {"mlp.up_proj.weight", []int64{12288, 4096}}, {"mlp.down_proj.weight", []int64{4096, 12288}},
-			{"input_layernorm.weight", []int64{4096}}, {"post_attention_layernorm.weight", []int64{4096}},
+			{"mlp.gate_proj.weight", []int64{c.MLP, c.Hidden}}, {"mlp.up_proj.weight", []int64{c.MLP, c.Hidden}}, {"mlp.down_proj.weight", []int64{c.Hidden, c.MLP}},
+			{"input_layernorm.weight", []int64{c.Hidden}}, {"post_attention_layernorm.weight", []int64{c.Hidden}},
 		} {
 			add(prefix+item.suffix, item.shape, torch.Float16, device)
 		}
 	}
-	add("model.language_model.norm.weight", []int64{4096}, torch.Float16, 1)
-	add("lm_head.weight", []int64{248320, 4096}, torch.Float16, 1)
+	add("model.language_model.norm.weight", []int64{c.Hidden}, torch.Float16, limits.OutputDevice)
+	add("lm_head.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.OutputDevice)
 	return
 }
 
 func validateAssemblyLimits(limits AssemblyLimits) error {
+	for _, bytes := range limits.PersistentBytes {
+		if bytes <= 0 {
+			return ErrAssembly
+		}
+	}
+	for _, device := range append(slices.Clone(limits.DeviceByLayer), limits.EmbeddingDevice, limits.OutputDevice) {
+		if device < 0 || device >= len(limits.PersistentBytes) {
+			return ErrAssembly
+		}
+	}
 	h := limits.HeaderLimits
 	if h.MaxHeaderBytes <= 0 || h.MaxHeaderBytes > 100_000_000 || h.MaxTensors <= 0 || h.MaxDimensions < 3 || h.MaxMetadataEntries <= 0 || h.MaxChunkBytes <= 0 ||
-		limits.HashChunkBytes < 4 || limits.HashChunkBytes > 4<<20 || limits.TensorCopyBytes <= 0 || limits.PersistentBytes[0] <= 0 || limits.PersistentBytes[1] <= 0 ||
+		limits.HashChunkBytes < 4 || limits.HashChunkBytes > 4<<20 || limits.TensorCopyBytes <= 0 || len(limits.PersistentBytes) == 0 || len(limits.PersistentBytes) > 4096 || limits.AdapterRank < 1 || limits.AdapterRank > 1<<20 || limits.AdapterAlpha <= 0 || math.IsNaN(limits.AdapterAlpha) || math.IsInf(limits.AdapterAlpha, 0) ||
 		limits.MaxInputElements <= 0 || limits.MaxScoreElements <= 0 || limits.MaxWorkingElements <= 0 || limits.Sequence.ChunkTokens <= 0 || limits.Sequence.ChunkTokens > tensor.MaxChunkTokens ||
 		limits.Sequence.MaxTokens <= 0 || limits.Sequence.MaxOwnedElements <= 0 {
 		return fmt.Errorf("%w: explicit positive parsing, copy, persistent and execution limits required", ErrAssembly)
@@ -504,61 +541,8 @@ func validateAssemblyLimits(limits AssemblyLimits) error {
 	return nil
 }
 
-func validateAssemblyConfig(data []byte) error {
-	var config struct {
-		ModelType string `json:"model_type"`
-		Tie       bool   `json:"tie_word_embeddings"`
-		Text      struct {
-			ModelType     string   `json:"model_type"`
-			Hidden        int      `json:"hidden_size"`
-			Vocab         int      `json:"vocab_size"`
-			MLP           int      `json:"intermediate_size"`
-			Layers        int      `json:"num_hidden_layers"`
-			Heads         int      `json:"num_attention_heads"`
-			KVHeads       int      `json:"num_key_value_heads"`
-			Dimension     int      `json:"head_dim"`
-			LayerTypes    []string `json:"layer_types"`
-			KHeads        int      `json:"linear_num_key_heads"`
-			VHeads        int      `json:"linear_num_value_heads"`
-			KDimension    int      `json:"linear_key_head_dim"`
-			VDimension    int      `json:"linear_value_head_dim"`
-			Conv          int      `json:"linear_conv_kernel_dim"`
-			Epsilon       float64  `json:"rms_norm_eps"`
-			Activation    string   `json:"hidden_act"`
-			AttentionBias bool     `json:"attention_bias"`
-			Dropout       float64  `json:"attention_dropout"`
-			Gate          bool     `json:"attn_output_gate"`
-			Tie           bool     `json:"tie_word_embeddings"`
-			RoPE          struct {
-				Theta       float64 `json:"rope_theta"`
-				Type        string  `json:"rope_type"`
-				Partial     float64 `json:"partial_rotary_factor"`
-				Interleaved bool    `json:"mrope_interleaved"`
-				Sections    []int   `json:"mrope_section"`
-			} `json:"rope_parameters"`
-		} `json:"text_config"`
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("%w: config: %v", ErrAssembly, err)
-	}
-	c := config.Text
-	if config.ModelType != "qwen3_5" || config.Tie || c.ModelType != "qwen3_5_text" || c.Hidden != 4096 || c.Vocab != 248320 || c.MLP != 12288 || c.Layers != 32 || c.Heads != 16 || c.KVHeads != 4 || c.Dimension != 256 || len(c.LayerTypes) != 32 || c.KHeads != 16 || c.VHeads != 32 || c.KDimension != 128 || c.VDimension != 128 || c.Conv != 4 || c.Epsilon != 1e-6 || c.Activation != "silu" || c.AttentionBias || c.Dropout != 0 || !c.Gate || c.Tie || c.RoPE.Theta != 1e7 || c.RoPE.Type != "default" || c.RoPE.Partial != .25 || !c.RoPE.Interleaved || !slices.Equal(c.RoPE.Sections, []int{11, 11, 10}) {
-		return fmt.Errorf("%w: fixed text geometry/config differs", ErrAssembly)
-	}
-	for i, kind := range c.LayerTypes {
-		expected := "linear_attention"
-		if i%4 == 3 {
-			expected = "full_attention"
-		}
-		if kind != expected {
-			return fmt.Errorf("%w: layer %d type differs", ErrAssembly, i)
-		}
-	}
-	return nil
-}
-
 func assemblyContext(ctx context.Context, plan *AssemblyPlan, provider ShardProvider) error {
-	if ctx == nil || plan == nil || len(plan.weights) != 427 || len(plan.adapters) != 32 || provider == nil {
+	if ctx == nil || plan == nil || len(plan.weights) == 0 || len(plan.adapters) == 0 || provider == nil {
 		return fmt.Errorf("%w: context, validated plan and provider required", ErrAssembly)
 	}
 	return ctx.Err()
@@ -649,7 +633,7 @@ func (r assemblyReader) ReadAt(data []byte, offset int64) (int, error) {
 }
 
 func validateAssemblyInitial(ctx context.Context, plan *AssemblyPlan, initial *InitialAdapter) error {
-	if initial == nil || len(initial.Parameters) != 32 || initial.SHA256 != plan.summary.Identity.InitialAdapterSHA256 {
+	if initial == nil || len(initial.Parameters) != len(plan.adapters) || initial.SHA256 != plan.summary.Identity.InitialAdapterSHA256 {
 		return fmt.Errorf("%w: exact initial adapter required", ErrAssembly)
 	}
 	digest := sha256.New()
@@ -727,7 +711,7 @@ func verifyAssemblyTensor(ctx context.Context, value *torch.Tensor, spec Assembl
 	return ctx.Err()
 }
 
-func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits AssemblyLimits, localMPS bool) {
+func wireAssembly(model *TextModel, values map[string]*torch.Tensor, c TextGeometry, limits AssemblyLimits, localMPS bool) {
 	get := func(source string) *torch.Tensor { return values["base_model.model."+source] }
 	model.Embedding = get("model.language_model.embed_tokens.weight")
 	model.FinalNorm = get("model.language_model.norm.weight")
@@ -736,17 +720,17 @@ func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits Asse
 		prefix := fmt.Sprintf("model.language_model.layers.%d.", i)
 		g := func(s string) *torch.Tensor { return get(prefix + s) }
 		layer := &model.Layers[i]
-		layer.Device = torch.CUDADevice(i / 16)
+		layer.Device = torch.CUDADevice(limits.DeviceByLayer[i])
 		if localMPS {
 			layer.Device = torch.MPSDevice()
 		}
-		layer.Config = layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: limits.MaxInputElements,
-			Full:   layers.AttentionConfig{Heads: 16, KVHeads: 4, HeadDimension: 256, RotaryDimension: 64, Epsilon: 1e-6, MaxScoreElements: limits.MaxScoreElements},
-			Linear: layers.LinearAttentionConfig{KeyHeads: 16, ValueHeads: 32, KeyDimension: 128, ValueDimension: 128, Epsilon: 1e-6, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence, FrozenWeightsValidated: true}}
+		layer.Config = layers.DecoderConfig{Epsilon: c.Epsilon, MaxInputElements: limits.MaxInputElements,
+			Full:   layers.AttentionConfig{Heads: c.Heads, KVHeads: c.KVHeads, HeadDimension: c.Dimension, RotaryDimension: int64(float64(c.Dimension) * c.RoPE.Partial), Epsilon: c.Epsilon, MaxScoreElements: limits.MaxScoreElements},
+			Linear: layers.LinearAttentionConfig{KeyHeads: c.KHeads, ValueHeads: c.VHeads, KeyDimension: c.KDimension, ValueDimension: c.VDimension, Epsilon: c.Epsilon, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence, FrozenWeightsValidated: true}}
 		layer.Weights = layers.DecoderWeights{InputNorm: g("input_layernorm.weight"), PostAttentionNorm: g("post_attention_layernorm.weight"), Gate: g("mlp.gate_proj.weight"), Up: g("mlp.up_proj.weight"), Down: g("mlp.down_proj.weight")}
-		if i%4 == 3 {
+		if c.LayerTypes[i] == "full_attention" {
 			layer.Weights.Full = &layers.AttentionWeights{Query: g("self_attn.q_proj.base_layer.weight"), Key: g("self_attn.k_proj.weight"), Value: g("self_attn.v_proj.base_layer.weight"), Output: g("self_attn.o_proj.weight"), QueryNorm: g("self_attn.q_norm.weight"), KeyNorm: g("self_attn.k_norm.weight")}
-			layer.Adapter = &layers.AttentionLoRA{QueryA: g("self_attn.q_proj.lora_A.default.weight"), QueryB: g("self_attn.q_proj.lora_B.default.weight"), ValueA: g("self_attn.v_proj.lora_A.default.weight"), ValueB: g("self_attn.v_proj.lora_B.default.weight"), Alpha: 8}
+			layer.Adapter = &layers.AttentionLoRA{QueryA: g("self_attn.q_proj.lora_A.default.weight"), QueryB: g("self_attn.q_proj.lora_B.default.weight"), ValueA: g("self_attn.v_proj.lora_A.default.weight"), ValueB: g("self_attn.v_proj.lora_B.default.weight"), Alpha: limits.AdapterAlpha}
 		} else {
 			layer.Weights.Linear = &layers.LinearAttentionWeights{QKV: g("linear_attn.in_proj_qkv.weight"), Z: g("linear_attn.in_proj_z.weight"), Beta: g("linear_attn.in_proj_b.weight"), Alpha: g("linear_attn.in_proj_a.weight"), Convolution: g("linear_attn.conv1d.weight"), ALog: g("linear_attn.A_log"), DTBias: g("linear_attn.dt_bias"), Norm: g("linear_attn.norm.weight"), Output: g("linear_attn.out_proj.weight")}
 		}
@@ -765,14 +749,20 @@ func assemblyDTypeName(dtype torch.DType) string {
 	return "torch.float16"
 }
 func validAssemblyShard(name string) bool {
-	for i := 1; i <= 4; i++ {
-		if name == fmt.Sprintf("model-%05d-of-00004.safetensors", i) {
-			return true
-		}
-	}
-	return false
+	return name != "" && name == filepath.Base(name) && !strings.ContainsAny(name, "/\\\\") && strings.HasSuffix(name, ".safetensors")
 }
 
 // Keep this compile-time assertion near the source adapter: no Seek, path,
 // filesystem mutation or process interface is required by the loader.
 var _ io.ReaderAt = assemblyReader{}
+
+// Geometry returns an owned copy of the admitted text structure.
+func (p *AssemblyPlan) Geometry() TextGeometry {
+	if p == nil {
+		return TextGeometry{}
+	}
+	c := p.geometry
+	c.LayerTypes = slices.Clone(c.LayerTypes)
+	c.RoPE.Sections = slices.Clone(c.RoPE.Sections)
+	return c
+}

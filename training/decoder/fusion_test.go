@@ -1,4 +1,4 @@
-package ornith
+package decoder
 
 import (
 	"math"
@@ -14,14 +14,14 @@ func fusionFixture() ([]float32, []int64, []FusionTeacher) {
 	targets := []int64{2, 1}
 	teachers := []FusionTeacher{
 		{
-			Name: "bonsai", Weight: 0.30,
+			Name: "teacher-a", Weight: 0.30,
 			Positions: []FusionTeacherPosition{
 				{RetainedMass: 0.90, TopK: []FusionTokenProbability{{2, 0.60}, {1, 0.30}}},
 				{RetainedMass: 1.00, TopK: []FusionTokenProbability{{1, 0.80}, {0, 0.20}}},
 			},
 		},
 		{
-			Name: "swift", Weight: 0.20,
+			Name: "teacher-b", Weight: 0.20,
 			Positions: []FusionTeacherPosition{
 				{RetainedMass: 0.80, TopK: []FusionTokenProbability{{2, 0.50}, {3, 0.30}}},
 				{RetainedMass: 0.70, TopK: []FusionTokenProbability{{1, 0.40}, {2, 0.30}}},
@@ -74,8 +74,8 @@ func TestFusionCotangentMatchesBlendedTargetAndFiniteDifference(t *testing.T) {
 	if math.Abs(stats.loss-wantLoss) > 1e-10 {
 		t.Fatalf("loss %.12g != %.12g", stats.loss, wantLoss)
 	}
-	if math.Abs(stats.effectiveMass["bonsai"]-0.285) > 1e-12 ||
-		math.Abs(stats.effectiveMass["swift"]-0.15) > 1e-12 {
+	if math.Abs(stats.effectiveMass["teacher-a"]-0.285) > 1e-12 ||
+		math.Abs(stats.effectiveMass["teacher-b"]-0.15) > 1e-12 {
 		t.Fatalf("effective mass: %#v", stats.effectiveMass)
 	}
 	for row := 0; row < 2; row++ {

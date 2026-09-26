@@ -112,3 +112,11 @@ func allFinite(values []float32) bool {
 }
 
 func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
+
+// ValidateAdamWConfig rejects a missing or nonfinite numerical recipe.
+func ValidateAdamWConfig(config AdamWConfig) error {
+	if !validConfig(config) {
+		return ErrAdamW
+	}
+	return nil
+}

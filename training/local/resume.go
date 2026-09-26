@@ -17,22 +17,10 @@ import (
 	"time"
 
 	"github.com/tayi-ai/arandu-llama/checkpoint"
+	"github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/optim"
-	"github.com/tayi-ai/arandu-llama/training/ornith"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
-
-type stepManifest struct {
-	Step              uint64  `json:"step"`
-	ExampleID         string  `json:"example_id"`
-	SupervisedTokens  int     `json:"supervised_tokens"`
-	LossBefore        float64 `json:"loss_before"`
-	UpdatedAdapterSHA string  `json:"updated_adapter_sha256"`
-	AdapterFileSHA    string  `json:"adapter_file_sha256"`
-	OptimizerFileSHA  string  `json:"optimizer_file_sha256"`
-	LogitsAfterSHA    string  `json:"logits_after_sha256"`
-	BaseRevision      string  `json:"base_revision"`
-}
 
 func readFrozenTensorFile(ctx context.Context, path, expectedSHA string, names []string, shapes [][]int64) ([][]float32, error) {
 	file, err := os.Open(path)
@@ -91,7 +79,7 @@ func readFrozenTensorFile(ctx context.Context, path, expectedSHA string, names [
 	return out, nil
 }
 
-func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example, previous, output string) error {
+func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe) error {
 	started := time.Now()
 	memory := func(phase string) {
 		stats, err := torch.ReadMPSMemory()
@@ -104,7 +92,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 		return err
 	}
 	var prior stepManifest
-	if err := json.Unmarshal(body, &prior); err != nil || prior.Step == 0 || prior.BaseRevision != "489cb97981b8654bcfcf30ce1f94ed1b62e07b53" || prior.AdapterFileSHA == "" || prior.OptimizerFileSHA == "" || output == "" && prior.ExampleID != row.ID || output != "" && prior.ExampleID == row.ID {
+	if err := json.Unmarshal(body, &prior); err != nil || prior.Step == 0 || prior.BaseRevision != recipe.BaseRevision || prior.AdapterFileSHA == "" || prior.OptimizerFileSHA == "" || output == "" && prior.ExampleID != row.ID || output != "" && prior.ExampleID == row.ID {
 		return errors.New("previous checkpoint identity differs")
 	}
 	names := make([]string, len(loaded.Parameters))
@@ -145,7 +133,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 	fmt.Printf("phase=resumed step=%d adapter_sha256=%s example=%s\n", prior.Step, digest, row.ID)
 	memory("resumed")
 	if output == "" {
-		observed, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+		observed, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens), recipe.MaxCheckpointBytes)
 		if err != nil || observed != prior.LogitsAfterSHA {
 			return errors.Join(errors.New("reloaded checkpoint inference differs"), err)
 		}
@@ -153,8 +141,8 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 		return nil
 	}
 	tokens := int64(len(row.InputIDs))
-	gradient, err := ornith.CompletionGradient(ctx, loaded.Model, row.InputIDs, row.PromptTokens,
-		ornith.Limits{MaxTokens: tokens, LogitRows: tokens - int64(row.PromptTokens) + 1, MaxCheckpointBytes: tokens * 4096 * 68}, 1)
+	gradient, err := decoder.CompletionGradient(ctx, loaded.Model, row.InputIDs, row.PromptTokens,
+		decoder.Limits{MaxTokens: tokens, LogitRows: tokens - int64(row.PromptTokens) + 1, MaxCheckpointBytes: recipe.MaxCheckpointBytes}, recipe.LossScale)
 	if err != nil || gradient.Tokens != len(row.InputIDs)-row.PromptTokens || len(gradient.Gradients) != len(names) {
 		return errors.Join(errors.New("resumed completion gradient incomplete"), err)
 	}
@@ -166,7 +154,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 		}
 		flat = append(flat, item.ValuesF32...)
 	}
-	config := optim.AdamWConfig{LearningRate: 2e-6, Beta1: .9, Beta2: .999, Epsilon: 1e-8, WeightDecay: 0, MaxGradientNorm: 1}
+	config := recipe.Optimizer
 	next, receipt, err := optim.UpdateAdamW(state, flat, config)
 	if err != nil {
 		return err
@@ -175,7 +163,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 	if err != nil || nextDigest == digest {
 		return errors.Join(errors.New("resumed update did not install"), err)
 	}
-	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens))
+	after, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens), recipe.MaxCheckpointBytes)
 	if err != nil {
 		return err
 	}
@@ -189,7 +177,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	temporary, err := os.MkdirTemp(parent, ".arasa-step-")
+	temporary, err := os.MkdirTemp(parent, ".training-step-")
 	if err != nil {
 		return err
 	}
@@ -212,7 +200,7 @@ func resumeNext(ctx context.Context, loaded *ornith.LoadedTextModel, row example
 	if err != nil {
 		return err
 	}
-	manifest := stepManifest{Step: next.Step, ExampleID: row.ID, SupervisedTokens: gradient.Tokens, LossBefore: gradient.Loss,
+	manifest := stepManifest{RecipeSHA256: recipe.Digest(), Step: next.Step, ExampleID: row.ID, SupervisedTokens: gradient.Tokens, LossBefore: gradient.Loss,
 		UpdatedAdapterSHA: nextDigest, AdapterFileSHA: adapterReceipt.SHA256, OptimizerFileSHA: momentsReceipt.SHA256,
 		LogitsAfterSHA: after, BaseRevision: prior.BaseRevision}
 	body, err = json.MarshalIndent(manifest, "", "  ")
