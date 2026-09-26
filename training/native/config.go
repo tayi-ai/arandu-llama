@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/tayi-ai/arandu-llama/checkpoint"
 	decoder "github.com/tayi-ai/arandu-llama/training/decoder"
 )
 
@@ -69,6 +70,9 @@ func NewNativeExperiment(config NativeExperimentConfig) (*NativeExperiment, erro
 	if len(config.Assembly.PersistentBytes) != 2 || len(config.Assembly.DeviceByLayer) != 32 || config.Assembly.EmbeddingDevice != 0 || config.Assembly.OutputDevice != 1 || config.Assembly.AdapterRank != 4 || config.Assembly.AdapterAlpha != 8 || config.Initializer.ExpectedSHA256 != r.LoRA.ExpectedInitialDigest || len(config.Initializer.Projections) == 0 || config.Rotary.ExpectedSHA256 != config.RotarySHA256 || config.Rotary.MaxTokens < 4096 || config.Rotary.Dimension < 2 || config.Rotary.Theta <= 0 || math.IsNaN(config.Rotary.Theta) || math.IsInf(config.Rotary.Theta, 0) {
 		return nil, errors.New("native experiment: explicit assembly, initialization and rotary configuration required")
 	}
+	if err := validateNativeAssemblyLimits(config.Assembly); err != nil {
+		return nil, err
+	}
 	for layer, device := range config.Assembly.DeviceByLayer {
 		if device != layer/16 {
 			return nil, errors.New("native experiment: unsupported layer placement")
@@ -126,6 +130,22 @@ func NewNativeExperiment(config NativeExperimentConfig) (*NativeExperiment, erro
 		return nil, err
 	}
 	return &NativeExperiment{config: owned}, nil
+}
+
+// Configuration must supply every assembly budget. Smaller parsing limits are
+// preserved; larger ones cannot expand the existing loader admission. Required
+// tensor/execution payloads are checked against these caps once tokenization
+// determines the sequence length, before weight loading or GPU admission.
+func validateNativeAssemblyLimits(limits decoder.AssemblyLimits) error {
+	h, ceiling := limits.HeaderLimits, checkpoint.DefaultLimits()
+	if h.MaxHeaderBytes <= 0 || h.MaxHeaderBytes > ceiling.MaxHeaderBytes || h.MaxTensors <= 0 || h.MaxTensors > ceiling.MaxTensors ||
+		h.MaxDimensions < 3 || h.MaxDimensions > ceiling.MaxDimensions || h.MaxMetadataEntries <= 0 || h.MaxMetadataEntries > ceiling.MaxMetadataEntries ||
+		h.MaxChunkBytes <= 0 || h.MaxChunkBytes > ceiling.MaxChunkBytes || limits.HashChunkBytes < 4 || limits.HashChunkBytes > 4<<20 ||
+		limits.TensorCopyBytes <= 0 || limits.MaxInputElements <= 0 || limits.MaxScoreElements <= 0 || limits.MaxWorkingElements <= 0 ||
+		limits.Sequence.ChunkTokens != 8 || limits.Sequence.MaxTokens <= 0 || limits.Sequence.MaxOwnedElements <= 0 {
+		return errors.New("native experiment: explicit assembly budgets and supported parsing and sequence limits are required")
+	}
+	return nil
 }
 
 // LoadNativeExperiment reads one hash-bound installation document. Callers pass

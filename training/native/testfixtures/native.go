@@ -21,7 +21,12 @@ func NativeDocument() []byte {
 		}
 	}
 	document := map[string]any{
-		"assembly":       map[string]any{"PersistentBytes": []int64{11042374656, 11042382848}, "DeviceByLayer": layers, "EmbeddingDevice": 0, "OutputDevice": 1, "AdapterRank": 4, "AdapterAlpha": 8},
+		"assembly": map[string]any{
+			"PersistentBytes": []int64{11042374656, 11042382848}, "DeviceByLayer": layers, "EmbeddingDevice": 0, "OutputDevice": 1, "AdapterRank": 4, "AdapterAlpha": 8,
+			"HeaderLimits":   map[string]any{"MaxHeaderBytes": 16 << 20, "MaxTensors": 65536, "MaxDimensions": 32, "MaxMetadataEntries": 65536, "MaxChunkBytes": 4 << 20},
+			"HashChunkBytes": 4 << 20, "TensorCopyBytes": int64(6102712320), "MaxInputElements": 4624384, "MaxScoreElements": 20394256, "MaxWorkingElements": 891134976,
+			"Sequence": map[string]any{"ChunkTokens": 8, "MaxTokens": 1129, "MaxOwnedElements": 99215936},
+		},
 		"initializer":    map[string]any{"Seed": 83, "PreludeBlocks": 24, "PreludeWidth": 4096, "PreludeLow": -.015625, "PreludeHigh": .015625, "ExpectedSHA256": digest, "Projections": projections},
 		"rotary":         map[string]any{"Theta": 10000000, "Dimension": 64, "MaxTokens": 4096, "HalfPrecision": true, "ExpectedSHA256": digest},
 		"schema_version": 1, "model_recipe": "fixture-decoder", "bundle_name": "native-fixture-v1", "manifest_sha256": digest, "base_path": "/cache/tayi/checkpoints/fixture",

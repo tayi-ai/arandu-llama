@@ -45,6 +45,13 @@ type ExperimentNativeExample struct {
 	LogitRows              int
 }
 
+// nativeExample binds training, canary and calibration to the same admitted
+// A/B/C/D token identities. It is called only after installation admission.
+func nativeExample(experiment *NativeExperiment, row ExperimentTrainingRow, prompt string) ExperimentNativeExample {
+	return ExperimentNativeExample{ExampleID: row.ExampleID, Prompt: prompt,
+		CandidateVocabularyIDs: experiment.config.Recipe.Data.CandidateVocabularyIDs, LogitRows: 2}
+}
+
 // ExperimentNativeLossGradient supplies the already scaled derivative of four raw
 // logits. The replica must call it exactly once and perform no further scaling,
 // averaging, clipping, loss computation or optimizer update.
@@ -271,7 +278,7 @@ func (training *ExperimentNativeTraining) execute(ctx context.Context, read func
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
-			gradient, observation, err := training.exampleGradient(ctx, rows[assignment.ExampleID], data.Demos, recipe)
+			gradient, observation, err := training.exampleGradient(ctx, rows[assignment.ExampleID], data.Demos)
 			if err != nil {
 				return result, err
 			}
@@ -357,7 +364,7 @@ func (training *ExperimentNativeTraining) execute(ctx context.Context, read func
 	return result, nil
 }
 
-func (training *ExperimentNativeTraining) exampleGradient(ctx context.Context, row ExperimentTrainingRow, demos []ExperimentTrainingRow, recipe ExperimentRecipe) (ExperimentNativeGradient, ExperimentNativeExampleProgress, error) {
+func (training *ExperimentNativeTraining) exampleGradient(ctx context.Context, row ExperimentTrainingRow, demos []ExperimentTrainingRow) (ExperimentNativeGradient, ExperimentNativeExampleProgress, error) {
 	observation := ExperimentNativeExampleProgress{ExampleID: row.ExampleID}
 	prompt, err := RenderExperimentTrainingPrompt(row, demos)
 	if err != nil {
@@ -365,8 +372,7 @@ func (training *ExperimentNativeTraining) exampleGradient(ctx context.Context, r
 	}
 	var callbackErr error
 	calls := 0
-	gradient, err := training.replica.Gradient(ctx, ExperimentNativeExample{ExampleID: row.ExampleID, Prompt: prompt,
-		CandidateVocabularyIDs: recipe.Data.CandidateVocabularyIDs, LogitRows: 2}, func(logits [4]float64) ([4]float64, error) {
+	gradient, err := training.replica.Gradient(ctx, nativeExample(training.experiment, row, prompt), func(logits [4]float64) ([4]float64, error) {
 		calls++
 		if calls != 1 {
 			callbackErr = fmt.Errorf("%w: derivative callback must run once", ErrExperimentNativeTraining)

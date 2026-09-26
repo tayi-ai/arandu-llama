@@ -138,6 +138,10 @@ func TestExperimentPinnedHeldout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assembly, err := memory.assemblyLimits(experiment)
+	if err != nil {
+		t.Fatal(err)
+	}
 	available, err := diagnosticHostAvailableRAM("/proc/meminfo")
 	if err != nil || available < memory.HostPreloadBytes {
 		t.Fatalf("host RAM admission failed: available=%d required=%d err=%v", available, memory.HostPreloadBytes, err)
@@ -166,7 +170,7 @@ func TestExperimentPinnedHeldout(t *testing.T) {
 		ConfigSHA256:         bundle.manifest.Files["config.json"],
 		ReferenceSHA256:      bundle.manifest.Files["initial-reference.json"],
 		InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest,
-	}, memory.assemblyLimits(experiment))
+	}, assembly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +206,7 @@ func TestExperimentPinnedHeldout(t *testing.T) {
 	}
 	replica, err := NewExperimentDecoderReplica(experiment, loaded, codec, plan, ExperimentDecoderReplicaOptions{
 		Limits:         decoder.Limits{MaxTokens: maximum, LogitRows: 2, MaxCheckpointBytes: memory.CheckpointBytes},
-		HashChunkBytes: 4 << 20, ParameterCopyBytes: 557056 * 4 * 3,
+		HashChunkBytes: assembly.HashChunkBytes, ParameterCopyBytes: 557056 * 4 * 3,
 		SourceManifestSHA256: experiment.config.Recipe.Model.ManifestSHA256,
 
 		ExpectedRotaryFrequencySHA256: experiment.config.RotarySHA256,

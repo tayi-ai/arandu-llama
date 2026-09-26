@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tayi-ai/arandu-llama/checkpoint"
 	decoder "github.com/tayi-ai/arandu-llama/training/decoder"
 	"github.com/tayi-ai/arandu-llama/training/sequence"
 	"github.com/tayi-ai/arandu-llama/training/tokenizer"
@@ -69,18 +68,44 @@ func ExperimentNativeMemory(maximumSequenceLength int64) (ExperimentNativeMemory
 	return plan, nil
 }
 
-func (p ExperimentNativeMemoryPlan) assemblyLimits(experiment *NativeExperiment) decoder.AssemblyLimits {
+// The measured sequence determines required payloads, but cannot increase an
+// installation's admitted budgets. Hash/parsing limits remain caller-owned;
+// sequence chunking stays in the explicitly supported numerical mode.
+func (p ExperimentNativeMemoryPlan) assemblyLimits(experiment *NativeExperiment) (decoder.AssemblyLimits, error) {
+	if experiment == nil {
+		return decoder.AssemblyLimits{}, errors.New("native experiment: installation is not configured")
+	}
+	expected, err := ExperimentNativeMemory(p.MaximumSequenceLength)
+	if err != nil || p != expected {
+		return decoder.AssemblyLimits{}, errors.New("native experiment: memory plan differs from supported sequence admission")
+	}
 	limits := experiment.config.Assembly
+	if err := validateNativeAssemblyLimits(limits); err != nil {
+		return decoder.AssemblyLimits{}, err
+	}
+	for _, budget := range []struct {
+		name       string
+		have, need int64
+	}{
+		{"tensor copies", limits.TensorCopyBytes, p.TensorCopyBytes},
+		{"input elements", limits.MaxInputElements, p.MaximumSequenceLength * 4096},
+		{"score elements", limits.MaxScoreElements, 16 * p.MaximumSequenceLength * p.MaximumSequenceLength},
+		{"working elements", limits.MaxWorkingElements, p.WorkingElements},
+		{"sequence tokens", limits.Sequence.MaxTokens, p.MaximumSequenceLength},
+		{"sequence elements", limits.Sequence.MaxOwnedElements, p.SequenceElements},
+	} {
+		if budget.have < budget.need {
+			return decoder.AssemblyLimits{}, fmt.Errorf("native experiment: configured %s budget %d is below required %d", budget.name, budget.have, budget.need)
+		}
+	}
 	limits.PersistentBytes = append([]int64(nil), limits.PersistentBytes...)
 	limits.DeviceByLayer = append([]int(nil), limits.DeviceByLayer...)
-	limits.HeaderLimits = checkpoint.DefaultLimits()
 	limits.TensorCopyBytes = p.TensorCopyBytes
-	limits.HashChunkBytes = 4 << 20
 	limits.MaxInputElements = p.MaximumSequenceLength * 4096
 	limits.MaxScoreElements = 16 * p.MaximumSequenceLength * p.MaximumSequenceLength
 	limits.MaxWorkingElements = p.WorkingElements
 	limits.Sequence = sequence.SequenceLimits{ChunkTokens: 8, MaxTokens: p.MaximumSequenceLength, MaxOwnedElements: p.SequenceElements}
-	return limits
+	return limits, nil
 }
 
 type experimentNativeResources struct {
@@ -451,6 +476,10 @@ func RunExperimentNative(experiment *NativeExperiment, parent context.Context, c
 	if err != nil {
 		return err
 	}
+	assembly, err := memory.assemblyLimits(experiment)
+	if err != nil {
+		return err
+	}
 	result["memory_plan"] = memory
 	available, err := config.HostAvailableBytes()
 	if err != nil {
@@ -474,7 +503,7 @@ func RunExperimentNative(experiment *NativeExperiment, parent context.Context, c
 		return errors.New("experiment native: two measured GPUs required")
 	}
 	for device, gpu := range probe.GPUs {
-		if gpu.Index != device || gpu.Capability != "7.5" || !strings.Contains(gpu.Name, "T10") || gpu.FreeBytes < gpu.CapBytes+(512<<20) || memory.assemblyLimits(experiment).PersistentBytes[device]+(512<<20) > gpu.CapBytes {
+		if gpu.Index != device || gpu.Capability != "7.5" || !strings.Contains(gpu.Name, "T10") || gpu.FreeBytes < gpu.CapBytes+(512<<20) || assembly.PersistentBytes[device]+(512<<20) > gpu.CapBytes {
 			return errors.New("experiment native: measured GPU capacity or SM75 identity rejected")
 		}
 	}
@@ -490,7 +519,7 @@ func RunExperimentNative(experiment *NativeExperiment, parent context.Context, c
 	if err != nil {
 		return err
 	}
-	plan, err := decoder.PlanTextAssembly(index, modelConfig, reference, decoder.AssemblyIdentity{IndexSHA256: bundle.manifest.Files["model.safetensors.index.json"], ConfigSHA256: bundle.manifest.Files["config.json"], ReferenceSHA256: bundle.manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, memory.assemblyLimits(experiment))
+	plan, err := decoder.PlanTextAssembly(index, modelConfig, reference, decoder.AssemblyIdentity{IndexSHA256: bundle.manifest.Files["model.safetensors.index.json"], ConfigSHA256: bundle.manifest.Files["config.json"], ReferenceSHA256: bundle.manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, assembly)
 	if err != nil {
 		return err
 	}
@@ -542,7 +571,7 @@ func RunExperimentNative(experiment *NativeExperiment, parent context.Context, c
 		_ = loaded.Close()
 		return err
 	}
-	replica, err := NewExperimentDecoderReplica(experiment, loaded, codec, plan, ExperimentDecoderReplicaOptions{Limits: decoder.Limits{MaxTokens: maximum, LogitRows: 2, MaxCheckpointBytes: memory.CheckpointBytes}, HashChunkBytes: 4 << 20, ParameterCopyBytes: 557056 * 4 * 3, SourceManifestSHA256: experiment.config.Recipe.Model.ManifestSHA256, ExpectedRotaryFrequencySHA256: experiment.config.RotarySHA256})
+	replica, err := NewExperimentDecoderReplica(experiment, loaded, codec, plan, ExperimentDecoderReplicaOptions{Limits: decoder.Limits{MaxTokens: maximum, LogitRows: 2, MaxCheckpointBytes: memory.CheckpointBytes}, HashChunkBytes: assembly.HashChunkBytes, ParameterCopyBytes: 557056 * 4 * 3, SourceManifestSHA256: experiment.config.Recipe.Model.ManifestSHA256, ExpectedRotaryFrequencySHA256: experiment.config.RotarySHA256})
 	if err != nil {
 		_ = loaded.Close()
 		return err
@@ -716,7 +745,7 @@ func experimentNativeCanaryGradient(experiment *NativeExperiment, ctx context.Co
 		}
 		var loss ExperimentLoss
 		calls := 0
-		gradient, err := replica.Gradient(ctx, ExperimentNativeExample{ExampleID: row.ExampleID, Prompt: prompt, CandidateVocabularyIDs: [4]int{357, 417, 351, 414}, LogitRows: 2}, func(logits [4]float64) ([4]float64, error) {
+		gradient, err := replica.Gradient(ctx, nativeExample(experiment, row, prompt), func(logits [4]float64) ([4]float64, error) {
 			calls++
 			var failure error
 			loss, failure = MultiTeacherLoss(experiment, logits, row)
@@ -845,7 +874,7 @@ func experimentNativeCalibrate(ctx context.Context, replica *ExperimentDecoderRe
 		if err != nil {
 			return err
 		}
-		measured, calibrationErr := replica.CalibrationObserved(ctx, ExperimentNativeExample{ExampleID: row.ExampleID, Prompt: prompt, CandidateVocabularyIDs: [4]int{357, 417, 351, 414}, LogitRows: 2}, trace.Observe)
+		measured, calibrationErr := replica.CalibrationObserved(ctx, nativeExample(replica.experiment, row, prompt), trace.Observe)
 		traceReceipt, traceErr := trace.Close()
 		if err = errors.Join(calibrationErr, traceErr); err != nil {
 			return err

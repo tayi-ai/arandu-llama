@@ -55,6 +55,8 @@ func TestExperimentDecoder16FrozenForwardDiagnosis(t *testing.T) {
 	}
 	memory, err := ExperimentNativeMemory(1129)
 	check(err)
+	assembly, err := memory.assemblyLimits(experiment)
+	check(err)
 	available, err := diagnosticHostAvailableRAM("/proc/meminfo")
 	check(err)
 	headroom, err := experimentNativeCgroupAvailable()
@@ -75,7 +77,7 @@ func TestExperimentDecoder16FrozenForwardDiagnosis(t *testing.T) {
 	}
 	previous := debug.SetMemoryLimit(2 << 30)
 	defer debug.SetMemoryLimit(previous)
-	plan, err := decoder.PlanTextAssembly(read("model.safetensors.index.json"), read("config.json"), read("initial-reference.json"), decoder.AssemblyIdentity{IndexSHA256: manifest.Files["model.safetensors.index.json"], ConfigSHA256: manifest.Files["config.json"], ReferenceSHA256: manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, memory.assemblyLimits(experiment))
+	plan, err := decoder.PlanTextAssembly(read("model.safetensors.index.json"), read("config.json"), read("initial-reference.json"), decoder.AssemblyIdentity{IndexSHA256: manifest.Files["model.safetensors.index.json"], ConfigSHA256: manifest.Files["config.json"], ReferenceSHA256: manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, assembly)
 	check(err)
 	sources, err := experimentNativeVerifySources(experiment, ctx, experiment.config.BasePath, read("base-manifest.json"))
 	check(err)
@@ -86,7 +88,7 @@ func TestExperimentDecoder16FrozenForwardDiagnosis(t *testing.T) {
 	check(err)
 	codec, err := tokenizer.Load(ctx, strings.NewReader(string(read("tokenizer.json"))), manifest.Files["tokenizer.json"], tokenizer.DefaultLimits())
 	check(err)
-	replica, err := NewExperimentDecoderReplica(experiment, loaded, codec, plan, ExperimentDecoderReplicaOptions{Limits: decoder.Limits{MaxTokens: 1129, LogitRows: 2, MaxCheckpointBytes: memory.CheckpointBytes}, HashChunkBytes: 4 << 20, ParameterCopyBytes: 557056 * 4 * 3, SourceManifestSHA256: experiment.config.Recipe.Model.ManifestSHA256, ExpectedRotaryFrequencySHA256: experiment.config.RotarySHA256})
+	replica, err := NewExperimentDecoderReplica(experiment, loaded, codec, plan, ExperimentDecoderReplicaOptions{Limits: decoder.Limits{MaxTokens: 1129, LogitRows: 2, MaxCheckpointBytes: memory.CheckpointBytes}, HashChunkBytes: assembly.HashChunkBytes, ParameterCopyBytes: 557056 * 4 * 3, SourceManifestSHA256: experiment.config.Recipe.Model.ManifestSHA256, ExpectedRotaryFrequencySHA256: experiment.config.RotarySHA256})
 	if err != nil {
 		_ = loaded.Close()
 		t.Fatal(err)
@@ -103,7 +105,7 @@ func TestExperimentDecoder16FrozenForwardDiagnosis(t *testing.T) {
 	}
 	prompt, err := RenderExperimentTrainingPrompt(order[0], data.Demos)
 	check(err)
-	ids, restore, err := replica.prepare(ctx, ExperimentNativeExample{ExampleID: order[0].ExampleID, Prompt: prompt, CandidateVocabularyIDs: [4]int{357, 417, 351, 414}, LogitRows: 2})
+	ids, restore, err := replica.prepare(ctx, nativeExample(experiment, order[0], prompt))
 	check(err)
 	defer restore()
 	if len(ids) != 879 {
@@ -259,6 +261,8 @@ func TestExperimentDecoder16CapturedReplay(t *testing.T) {
 	}
 	memory, e := ExperimentNativeMemory(1129)
 	check(e)
+	limits, e := memory.assemblyLimits(experiment)
+	check(e)
 	available, e := diagnosticHostAvailableRAM("/proc/meminfo")
 	check(e)
 	if available < memory.HostPreloadBytes {
@@ -275,7 +279,6 @@ func TestExperimentDecoder16CapturedReplay(t *testing.T) {
 		}
 		check(torch.SetCUDAMemoryFraction(i, .80))
 	}
-	limits := memory.assemblyLimits(experiment)
 	plan, e := decoder.PlanTextAssembly(read("model.safetensors.index.json"), read("config.json"), read("initial-reference.json"), decoder.AssemblyIdentity{IndexSHA256: manifest.Files["model.safetensors.index.json"], ConfigSHA256: manifest.Files["config.json"], ReferenceSHA256: manifest.Files["initial-reference.json"], InitialAdapterSHA256: experiment.config.Recipe.LoRA.ExpectedInitialDigest}, limits)
 	check(e)
 	f, e := os.Open("/cache/tayi/checkpoints/fixture/model-00003-of-00004.safetensors")
