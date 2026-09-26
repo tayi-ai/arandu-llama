@@ -312,7 +312,11 @@ func (m *TeacherModel) CaptureTeacherForced(tokens, positions []int32, options T
 		TokenDigest: TeacherTokenDigest(tokens, positions), Tensor: options.Tensor, DType: "f32", Width: int(width), Vocabulary: int(vocabulary),
 		Rows: make([]TeacherCaptureRow, len(positions))}
 	for i, position := range positions {
-		row := TeacherCaptureRow{Position: position, GoldNextToken: tokens[position+1], RetainedMass: mass[i],
+		retained, err := boundedTeacherMass(mass[i])
+		if err != nil {
+			return nil, err
+		}
+		row := TeacherCaptureRow{Position: position, GoldNextToken: tokens[position+1], RetainedMass: retained,
 			TopK: make([]TeacherProbability, options.TopK), Features: features[i*int(width) : (i+1)*int(width)]}
 		for k := range row.TopK {
 			offset := i*options.TopK + k
@@ -330,4 +334,15 @@ func (m *TeacherModel) CaptureTeacherForced(tokens, positions []int32, options T
 	_ = binary.Write(hash, binary.LittleEndian, options.CPUOnly)
 	capture.SnapshotDigest = hex.EncodeToString(hash.Sum(nil))
 	return capture, nil
+}
+
+// The native softmax denominator and retained probabilities are accumulated in
+// different orders. At full vocabulary, rounding can put the mass just above
+// one. Bound only this metadata within the cache's 1e-10 sum-check tolerance;
+// individual probabilities remain unchanged and larger discrepancies fail.
+func boundedTeacherMass(mass float64) (float64, error) {
+	if math.IsNaN(mass) || math.IsInf(mass, 0) || mass < 0 || mass > 1+1e-10 {
+		return 0, errors.New("teacher capture: invalid retained probability mass")
+	}
+	return math.Min(mass, 1), nil
 }
