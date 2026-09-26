@@ -6,3 +6,5 @@ import "context"
 
 // Run refuses native calculation without the required backend.
 func Run(context.Context, Config) (Progress, error) { return Progress{}, ErrUnavailable }
+
+func runStageDelivery(context.Context, Config, *stepHooks) error { return ErrUnavailable }

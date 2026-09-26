@@ -41,8 +41,12 @@ func Run(ctx context.Context, c Config) (Progress, error) {
 		return progress, nil
 	}
 	if err := run(ctx, c.BundleDir, c.ModelDir, c.DataPath, c.CheckpointRoot,
-		progress.Checkpoint, "", c.MaxTokens, remaining, c); err != nil {
+		progress.Checkpoint, "", c.MaxTokens, remaining, c, nil); err != nil {
 		return Progress{}, err
 	}
 	return LatestCheckpoint(c)
+}
+
+func runStageDelivery(ctx context.Context, c Config, hooks *stepHooks) error {
+	return run(ctx, c.BundleDir, c.ModelDir, c.DataPath, c.CheckpointRoot, c.InitialCheckpoint, "", c.MaxTokens, c.MaxSteps, c, hooks)
 }

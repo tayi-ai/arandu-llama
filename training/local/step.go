@@ -45,11 +45,21 @@ func tensorDigest(values []float32) string {
 }
 
 func writeAndReadback(ctx context.Context, path string, tensors []checkpoint.Float32Tensor) (checkpoint.WriteReceipt, error) {
+	return writeAndReadbackWithStorage(ctx, path, tensors, nil)
+}
+
+func writeAndReadbackWithStorage(ctx context.Context, path string, tensors []checkpoint.Float32Tensor, storage *stepStorage) (checkpoint.WriteReceipt, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return checkpoint.WriteReceipt{}, err
 	}
-	receipt, writeErr := checkpoint.WriteFloat32(ctx, file, tensors, checkpoint.DefaultLimits())
+	limits := checkpoint.DefaultLimits()
+	var writer io.Writer = file
+	if storage != nil {
+		limits = storage.checkpoint
+		writer = &stageBoundWriter{out: file, remaining: storage.tensorBytes}
+	}
+	receipt, writeErr := checkpoint.WriteFloat32(ctx, writer, tensors, limits)
 	err = errors.Join(writeErr, file.Sync(), file.Close())
 	if err != nil {
 		return checkpoint.WriteReceipt{}, err
@@ -63,14 +73,14 @@ func writeAndReadback(ctx context.Context, path string, tensors []checkpoint.Flo
 	if err != nil || stat.Size() != receipt.Bytes {
 		return checkpoint.WriteReceipt{}, errors.New("checkpoint size differs after write")
 	}
-	index, err := checkpoint.OpenSafetensors(file, stat.Size(), checkpoint.DefaultLimits())
+	index, err := checkpoint.OpenSafetensors(file, stat.Size(), limits)
 	if err != nil {
 		return checkpoint.WriteReceipt{}, err
 	}
 	if len(index.Tensors()) != len(tensors) {
 		return checkpoint.WriteReceipt{}, errors.New("checkpoint tensor count differs after write")
 	}
-	buffer := make([]byte, 4<<20)
+	buffer := make([]byte, limits.MaxChunkBytes)
 	for _, item := range tensors {
 		actual, err := index.HashTensor(ctx, item.Name, buffer)
 		if err != nil || actual != tensorDigest(item.Values) {

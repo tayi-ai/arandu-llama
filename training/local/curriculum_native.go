@@ -12,6 +12,10 @@ import (
 )
 
 func runCurriculum(ctx context.Context, loaded *decoder.LoadedTextModel, data, previous, output string, maxTokens, maxSteps int, c Config) error {
+	return runCurriculumWithHooks(ctx, loaded, data, previous, output, maxTokens, maxSteps, c, nil, torch.MPSDevice())
+}
+
+func runCurriculumWithHooks(ctx context.Context, loaded *decoder.LoadedTextModel, data, previous, output string, maxTokens, maxSteps int, c Config, hooks *stepHooks, device torch.Device) error {
 	rows, prior, next, err := curriculumPosition(data, previous, c)
 	if err != nil {
 		return err
@@ -28,7 +32,12 @@ func runCurriculum(ctx context.Context, loaded *decoder.LoadedTextModel, data, p
 		if err != nil {
 			return err
 		}
-		tables, err := decoder.TextRotary(ctx, len(row.InputIDs), torch.MPSDevice(), c.Recipe.Rotary)
+		if hooks != nil {
+			if err := hooks.before(ctx, prior.Step+1, row.ID); err != nil {
+				return err
+			}
+		}
+		tables, err := decoder.TextRotary(ctx, len(row.InputIDs), device, c.Recipe.Rotary)
 		if err != nil {
 			return err
 		}
@@ -38,7 +47,11 @@ func runCurriculum(ctx context.Context, loaded *decoder.LoadedTextModel, data, p
 			}
 		}
 		target := filepath.Join(output, fmt.Sprintf("step-%03d", prior.Step+1))
-		stepErr := resumeNext(ctx, loaded, row, previous, target, c.Recipe)
+		var storage *stepStorage
+		if hooks != nil {
+			storage = hooks.storage
+		}
+		stepErr := resumeNextWithStorage(ctx, loaded, row, previous, target, c.Recipe, storage)
 		for layer := range loaded.Model.Layers {
 			if loaded.Model.Layers[layer].Weights.Full != nil {
 				loaded.Model.Layers[layer].Cosine, loaded.Model.Layers[layer].Sine = nil, nil
@@ -51,6 +64,11 @@ func runCurriculum(ctx context.Context, loaded *decoder.LoadedTextModel, data, p
 		previous = target
 		prior.Step++
 		completed++
+		if hooks != nil {
+			if err := hooks.after(ctx, Progress{Step: prior.Step, ExampleID: row.ID, Checkpoint: target}); err != nil {
+				return err
+			}
+		}
 	}
 	if completed == 0 {
 		return errors.New("no admitted curriculum step was run")

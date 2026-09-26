@@ -85,8 +85,16 @@ func selectedID(path, id string) (example, error) {
 	}
 }
 
-func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID string, curriculumMax, curriculumSteps int, c Config) (err error) {
+func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID string, curriculumMax, curriculumSteps int, c Config, hooks *stepHooks) (err error) {
 	read := func(name, expected string) ([]byte, error) {
+		if hooks != nil && hooks.storage != nil {
+			root, err := stageRoot(bundle)
+			if err != nil {
+				return nil, err
+			}
+			body, readErr := stageRead(ctx, root, name, hooks.storage.metadataBytes, expected)
+			return body, errors.Join(readErr, root.Close())
+		}
 		body, err := os.ReadFile(filepath.Join(bundle, name))
 		if err != nil {
 			return nil, err
@@ -152,7 +160,7 @@ func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID str
 	defer func() { err = errors.Join(err, loaded.Close()) }()
 	fmt.Printf("phase=loaded elapsed=%s receipts=%d\n", time.Since(start), len(loaded.Receipts))
 	if curriculumMax > 0 {
-		return runCurriculum(ctx, loaded, data, reload, output, curriculumMax, curriculumSteps, c)
+		return runCurriculumWithHooks(ctx, loaded, data, reload, output, curriculumMax, curriculumSteps, c, hooks, torch.MPSDevice())
 	}
 	tables, err := decoder.TextRotary(ctx, len(row.InputIDs), torch.MPSDevice(), c.Recipe.Rotary)
 	if err != nil {

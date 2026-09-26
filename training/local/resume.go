@@ -80,6 +80,10 @@ func readFrozenTensorFile(ctx context.Context, path, expectedSHA string, names [
 }
 
 func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe) error {
+	return resumeNextWithStorage(ctx, loaded, row, previous, output, recipe, nil)
+}
+
+func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe, storage *stepStorage) error {
 	started := time.Now()
 	memory := func(phase string) {
 		stats, err := torch.ReadMPSMemory()
@@ -192,11 +196,11 @@ func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row exampl
 		newMoments = append(newMoments, checkpoint.Float32Tensor{Name: "m." + name, Shape: shape, Values: next.First[position : position+count]}, checkpoint.Float32Tensor{Name: "v." + name, Shape: shape, Values: next.Second[position : position+count]})
 		position += count
 	}
-	adapterReceipt, err := writeAndReadback(ctx, filepath.Join(temporary, "adapter_model.safetensors"), newAdapter)
+	adapterReceipt, err := writeAndReadbackWithStorage(ctx, filepath.Join(temporary, "adapter_model.safetensors"), newAdapter, storage)
 	if err != nil {
 		return err
 	}
-	momentsReceipt, err := writeAndReadback(ctx, filepath.Join(temporary, "optimizer_moments.safetensors"), newMoments)
+	momentsReceipt, err := writeAndReadbackWithStorage(ctx, filepath.Join(temporary, "optimizer_moments.safetensors"), newMoments, storage)
 	if err != nil {
 		return err
 	}
@@ -207,6 +211,9 @@ func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row exampl
 	if err != nil {
 		return err
 	}
+	if storage != nil && int64(len(body)+1) > storage.manifestBytes {
+		return ErrStage
+	}
 	file, err := os.OpenFile(filepath.Join(temporary, "manifest.json"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -216,6 +223,9 @@ func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row exampl
 		return err
 	}
 	if err := errors.Join(file.Sync(), file.Close()); err != nil {
+		return err
+	}
+	if err := syncLocalDirectory(temporary); err != nil {
 		return err
 	}
 	if err := os.Rename(temporary, output); err != nil {
