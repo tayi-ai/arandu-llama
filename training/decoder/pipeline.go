@@ -39,7 +39,7 @@ type TrainingBackend struct {
 // This adapter owns neither model nor table lifetime and starts no execution.
 func NewTrainingBackend(loaded *LoadedTextModel, signals *pipeline.Signals, limits Limits, prepare func(context.Context, int) (func() error, error), admission TrainingAdmission) (*TrainingBackend, error) {
 	if !signals.Admitted() || signals.Student() != admission.Student {
-		return nil, errors.New("pipeline: independently admitted signals differ")
+		return nil, errors.New("pipeline: independently admitted assembly or student differs")
 	}
 	result, err := newTrainingState(loaded, signals.Training(), limits, prepare, admission)
 	if err != nil {
