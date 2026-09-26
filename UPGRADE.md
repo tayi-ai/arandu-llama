@@ -8,11 +8,13 @@ in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard
 identity remain mandatory; externalizing configuration does not waive lineage,
 artifact integrity or license obligations.
 
-Replace `AdmittedMXManifest` and `AdmittedMXManifestFor` with
+Replace `backends/mx.AdmittedMXManifest` and `backends/mx.AdmittedMXManifestFor` with
 `MXCatalog.ManifestFor`. Replace `MXModelRecipeForDigest` with
-`MXCatalog.RecipeForDigest`. Replace `MXModelMXFP4`, `MXModelQ2K` and
-`MXModelTayiQ2Progressive` with installation-owned `MXModelRecipe` selectors.
-`MXConfig.ModelRecipe` becomes `MXConfig.Model`. No model is selected by omission.
+`MXCatalog.RecipeForDigest`; its full removed name is
+`backends/mx.MXModelRecipeForDigest`. Replace `backends/mx.MXModelMXFP4`,
+`backends/mx.MXModelQ2K` and `backends/mx.MXModelTayiQ2Progressive` with
+installation-owned `MXModelRecipe` selectors. `backends/mx.MXConfig.ModelRecipe`
+becomes `MXConfig.Model`. No model is selected by omission.
 Runtime binary identities and the qualified SM75/64-backend build are unchanged.
 
 Training backends use `training/decoder`; geometry, initial projections, rotary
