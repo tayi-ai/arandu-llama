@@ -14,7 +14,7 @@ The base is loaded once, in whatever representation it was quantised to. The
 adapter is a separate GGUF, loaded against that model:
 
 ```go
-model, err := llama.LoadModel("qwen3.8-27b-q4_k_m.gguf", llama.WithGPULayers(-1))
+model, err := llama.LoadModel("model.gguf", llama.WithGPULayers(-1))
 defer model.Close()
 
 adapter, err := model.LoadAdapter("rank4.gguf")

@@ -128,7 +128,7 @@ because 403 confirms the row exists.
 Loading a model, applying an adapter and scoring an example:
 
 ```go
-model, err := llama.LoadModel("qwen3.8-27b-q4_k_m.gguf", llama.WithGPULayers(-1))
+model, err := llama.LoadModel("model.gguf", llama.WithGPULayers(-1))
 defer model.Close()
 
 ctx, err := model.NewContext(llama.WithContextSize(8192))
