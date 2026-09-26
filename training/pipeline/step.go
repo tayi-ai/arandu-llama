@@ -80,8 +80,8 @@ func Step(ctx context.Context, model Model, cfg StepConfig) (StepReceipt, error)
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if len(cfg.Protection) > protection.DefaultConfig().MaxConstraints {
-		return result, protection.ErrLimit
+	if err := protection.ValidateBounds(cfg.Solver, 1, len(cfg.Protection)); err != nil {
+		return result, err
 	}
 	cfg.Protection = slices.Clone(cfg.Protection)
 	for i := range cfg.Protection {
@@ -106,12 +106,8 @@ func Step(ctx context.Context, model Model, cfg StepConfig) (StepReceipt, error)
 	if len(prior) == 0 {
 		return result, errors.New("pipeline: empty parameter vector")
 	}
-	limits := protection.DefaultConfig()
-	if cfg.Solver.MaxParameters < 1 || cfg.Solver.MaxConstraints < 1 || cfg.Solver.MaxCoefficients < 1 ||
-		len(prior) > cfg.Solver.MaxParameters || len(prior) > limits.MaxParameters ||
-		len(cfg.Protection) > cfg.Solver.MaxConstraints || len(cfg.Protection) > limits.MaxConstraints ||
-		len(prior) > cfg.Solver.MaxCoefficients/len(cfg.Protection) || len(prior) > limits.MaxCoefficients/len(cfg.Protection) {
-		return result, protection.ErrLimit
+	if err := protection.ValidateBounds(cfg.Solver, len(prior), len(cfg.Protection)); err != nil {
+		return result, err
 	}
 	for _, value := range prior {
 		if !finite(float64(value)) {

@@ -260,13 +260,9 @@ func (p ConstrainedProtocol) validate() (int, error) {
 	}
 	for _, update := range p.Updates {
 		x := update.Config
-		s := x.Solver
-		hard := protection.DefaultConfig()
 		if !finite(x.Lambda) || x.Lambda <= 0 || !finite(x.MinimumGain) || x.MinimumGain < 0 ||
-			len(x.Protection) < 1 || len(x.Protection) > hard.MaxConstraints || s.MaxParameters < n || s.MaxParameters > hard.MaxParameters ||
-			s.MaxConstraints < len(x.Protection) || s.MaxConstraints > hard.MaxConstraints || s.MaxCoefficients < n || s.MaxCoefficients > hard.MaxCoefficients || n > s.MaxCoefficients/len(x.Protection) ||
-			s.MaxSweeps < 1 || s.MaxSweeps > 100000 || s.MaxWork < 1 || s.MaxWork > 1_000_000_000 || !finite(s.PrimalTolerance) || s.PrimalTolerance <= 0 ||
-			!finite(s.StationarityTolerance) || s.StationarityTolerance <= 0 || !finite(s.ComplementarityTolerance) || s.ComplementarityTolerance <= 0 || len(update.Sources) < 1 || len(update.Sources) > 64 {
+			len(x.Protection) < 1 || protection.ValidateBounds(x.Solver, n, len(x.Protection)) != nil ||
+			len(update.Sources) < 1 || len(update.Sources) > 64 {
 			return 0, ErrConstrained
 		}
 		ids := map[string]bool{}

@@ -27,7 +27,7 @@ var ErrNotConverged = errors.New("protection: convergence not certified")
 const (
 	maxParameters   = 1 << 20
 	maxConstraints  = 256
-	maxCoefficients = 8 << 20
+	maxCoefficients = 32 << 20
 	maxSweeps       = 100000
 	maxWork         = 1000000000
 )
@@ -49,9 +49,12 @@ type Problem struct {
 }
 
 // Config bounds memory, scalar visits and sweeps, and sets absolute KKT tolerances.
-// All fields must be positive. Limits may only tighten the hard ceilings used by
-// DefaultConfig, except MaxSweeps (ceiling 100000) and MaxWork (ceiling 1e9).
+// All fields must be positive. Hard ceilings are 1048576 parameters, 256
+// constraints, 33554432 coefficients, 100000 sweeps and 1e9 scalar visits.
+// Raising a default requires an explicit, independently admitted resource budget.
 // MaxCoefficients bounds Parameters * Constraints without building a Gram matrix.
+// The coefficient ceiling permits at most 256 MiB of input float64 Jacobians;
+// callers must also budget their model, snapshots and other solver allocations.
 // MaxWork counts scalar vector visits, not wall time or exact CPU instructions.
 type Config struct {
 	MaxParameters            int
@@ -68,7 +71,21 @@ type Config struct {
 // coefficients, with 1000 sweeps, 500000000 scalar visits and 1e-8 tolerances.
 // These are numerical resource defaults, not scientifically qualified thresholds.
 func DefaultConfig() Config {
-	return Config{maxParameters, maxConstraints, maxCoefficients, 1000, 500000000, 1e-8, 1e-8, 1e-8}
+	return Config{maxParameters, maxConstraints, 8 << 20, 1000, 500000000, 1e-8, 1e-8, 1e-8}
+}
+
+// ValidateBounds checks policy and problem dimensions without allocating or
+// computing. All consumers use this admission, so a configured budget cannot
+// pass queue admission and later fail a different hard-coded default ceiling.
+func ValidateBounds(config Config, parameters, constraints int) error {
+	if !validConfig(config) || parameters < 1 || constraints < 0 {
+		return ErrProblem
+	}
+	if parameters > config.MaxParameters || constraints > config.MaxConstraints ||
+		constraints != 0 && parameters > config.MaxCoefficients/constraints {
+		return ErrLimit
+	}
+	return nil
 }
 
 // Certificate reports independently recomputed floating-point KKT residuals.
@@ -128,12 +145,12 @@ func checkContext(ctx context.Context, i int) error {
 // incompatible or poorly scaled systems may exhaust policy and are refused.
 // The implementation has O(parameters + constraints) additional memory.
 func Solve(ctx context.Context, problem Problem, config Config) (Solution, error) {
-	if ctx == nil || !validConfig(config) || !finite(problem.Lambda) || problem.Lambda <= 0 || len(problem.Gradient) == 0 {
+	if ctx == nil || !finite(problem.Lambda) || problem.Lambda <= 0 {
 		return Solution{}, ErrProblem
 	}
 	n, m := len(problem.Gradient), len(problem.Constraints)
-	if n > config.MaxParameters || m > config.MaxConstraints || m != 0 && n > config.MaxCoefficients/m {
-		return Solution{}, ErrLimit
+	if err := ValidateBounds(config, n, m); err != nil {
+		return Solution{}, err
 	}
 	budget := workBudget{ctx: ctx, limit: config.MaxWork}
 	if err := budget.spend(n); err != nil {
