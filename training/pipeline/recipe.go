@@ -48,39 +48,59 @@ type Stage struct {
 // against the selected executor before queueing; a valid recipe is not itself
 // evidence that its model, projections or quantization have been qualified.
 type Recipe struct {
-	Version     int           `json:"schema_version"`
-	ID          string        `json:"id"`
-	Method      string        `json:"method"`
-	Student     ArtifactRef   `json:"student"`
-	Teachers    []ArtifactRef `json:"teachers"`
-	Training    ArtifactRef   `json:"training"`
-	Recovery    ArtifactRef   `json:"recovery"`
-	Calibration ArtifactRef   `json:"calibration"`
-	Protection  ArtifactRef   `json:"protection"`
-	Heldout     ArtifactRef   `json:"heldout"`
-	Stages      []Stage       `json:"stages"`
+	Version int `json:"schema_version"`
+	// Scope is empty for v1's full method. V2 requires "master" and ends only
+	// after the six complete phases through Master evaluation, before variants.
+	Scope    string        `json:"scope,omitempty"`
+	ID       string        `json:"id"`
+	Method   string        `json:"method"`
+	Student  ArtifactRef   `json:"student"`
+	Teachers []ArtifactRef `json:"teachers"`
+	Training ArtifactRef   `json:"training"`
+	Recovery ArtifactRef   `json:"recovery"`
+	// Calibration may be the zero reference only in v2 Master scope. If pinned,
+	// it remains separate from every other dataset and may feed alignment only.
+	// It neither replaces final Heldout nor declares a calibration phase complete.
+	Calibration ArtifactRef `json:"calibration"`
+	Protection  ArtifactRef `json:"protection"`
+	Heldout     ArtifactRef `json:"heldout"`
+	Stages      []Stage     `json:"stages"`
 }
 
-// Validate refuses incomplete methods, phase reordering and mixed data roles.
+// Validate refuses incomplete declared deliveries, reordering and mixed roles.
+// V1 requires Master and all variants. V2 Master scope does not certify any
+// calibration or quantized variant, and cannot reuse a v1 recipe identity.
 func (r Recipe) Validate() error {
-	if r.Version != 1 || !identifier(r.ID) || r.Method != "generational-fusion-v1" || len(r.Teachers) < 1 || len(r.Teachers) > 8 || len(r.Stages) != 13 {
+	master := r.Version == 2 && r.Scope == "master"
+	full := r.Version == 1 && r.Scope == ""
+	if (!master && !full) || !identifier(r.ID) || r.Method != "generational-fusion-v1" || len(r.Teachers) < 1 || len(r.Teachers) > 8 || (full && len(r.Stages) != 13) || (master && len(r.Stages) != 6) {
 		return errors.New("training recipe: invalid version, method or stage count")
 	}
+	data := []ArtifactRef{r.Training, r.Recovery}
+	if !master || r.Calibration != (ArtifactRef{}) {
+		data = append(data, r.Calibration)
+	}
+	data = append(data, r.Protection, r.Heldout)
+	artifacts := append([]ArtifactRef{r.Student}, data...)
+	artifacts = append(artifacts, r.Teachers...)
 	seenArtifacts := map[string]string{}
-	for _, ref := range append([]ArtifactRef{r.Student, r.Training, r.Recovery, r.Calibration, r.Protection, r.Heldout}, r.Teachers...) {
+	for _, ref := range artifacts {
 		if !identifier(ref.ID) || !digest(ref.SHA256) || seenArtifacts[ref.ID] != "" {
 			return errors.New("training recipe: invalid or repeated artifact identity")
 		}
 		seenArtifacts[ref.ID] = ref.SHA256
 	}
 	dataDigests := map[string]bool{}
-	for _, ref := range []ArtifactRef{r.Training, r.Recovery, r.Calibration, r.Protection, r.Heldout} {
+	for _, ref := range data {
 		if dataDigests[ref.SHA256] {
 			return errors.New("training recipe: data roles share an artifact")
 		}
 		dataDigests[ref.SHA256] = true
 	}
-	order := []Phase{PhaseSFT, PhaseTeacherCache, PhaseAlignment, PhaseFusion, PhaseRecovery, PhaseMaster, PhaseCalibration}
+	order := []Phase{PhaseSFT, PhaseTeacherCache, PhaseAlignment, PhaseFusion, PhaseRecovery, PhaseMaster}
+	if full {
+		order = append(order, PhaseCalibration)
+	}
 	index := 0
 	seenStages := map[string]bool{}
 	formats := map[string]bool{}
@@ -98,6 +118,9 @@ func (r Recipe) Validate() error {
 		}
 		if inputs[r.Heldout.ID] && stage.Phase != PhaseMaster {
 			return errors.New("training recipe: heldout data cannot feed adaptation")
+		}
+		if master && r.Calibration != (ArtifactRef{}) && inputs[r.Calibration.ID] && stage.Phase != PhaseAlignment {
+			return errors.New("training recipe: optional Master calibration data can feed alignment only")
 		}
 		if inputs[r.Protection.ID] && stage.Phase != PhaseFusion && stage.Phase != PhaseRecovery && stage.Phase != PhaseVariantRecovery && stage.Phase != PhaseMaster {
 			return errors.New("training recipe: protection data cannot feed SFT, teacher cache or alignment")
@@ -176,6 +199,16 @@ func DecodeRecipe(body []byte, expected string) (Recipe, error) {
 	d.DisallowUnknownFields()
 	if d.Decode(&r) != nil || d.Decode(new(any)) != io.EOF {
 		return Recipe{}, errors.New("training recipe: invalid typed document")
+	}
+	if r.Version == 1 {
+		// Scope was not a v1 wire field. Preserve its historical rejection even
+		// when a caller explicitly supplies the new field as empty or null.
+		var fields struct {
+			Scope json.RawMessage `json:"scope"`
+		}
+		if json.Unmarshal(body, &fields) != nil || fields.Scope != nil {
+			return Recipe{}, errors.New("training recipe: scope is not a v1 field")
+		}
 	}
 	return r, r.Validate()
 }
