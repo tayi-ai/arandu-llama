@@ -29,6 +29,7 @@ type durableSession struct {
 	directory string
 	root      *os.Root
 	lock      *os.File
+	capacity  *os.File
 	state     durableState
 }
 
@@ -74,6 +75,12 @@ func (r *DurableRuntime) openExecution(ctx context.Context, x Execution) (_ *dur
 		}
 	}()
 	s.lock, err = acquireDurableLock(runRoot)
+	if err != nil {
+		return nil, err
+	}
+	// Acquire the nonblocking run lock first: duplicate generations must still
+	// fail immediately even when this run is waiting behind another capacity user.
+	s.capacity, err = acquireDurableCapacity(ctx, root)
 	if err != nil {
 		return nil, err
 	}
@@ -132,11 +139,42 @@ func (r *DurableRuntime) openExecution(ctx context.Context, x Execution) (_ *dur
 }
 
 func (s *durableSession) close() {
+	if s.capacity != nil {
+		s.capacity.Close()
+	}
 	if s.lock != nil {
 		s.lock.Close() // Closing the descriptor releases the OS lock, even after a crash.
 	}
 	if s.root != nil {
 		s.root.Close()
+	}
+}
+
+// The root uses the same permanent lock inode protocol as each run. Polling is
+// bounded and synchronous; cancellation never leaves a detached lock waiter.
+func acquireDurableCapacity(ctx context.Context, root *os.Root) (*os.File, error) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		lock, err := acquireDurableLock(root)
+		if err == nil {
+			if err := ctx.Err(); err != nil {
+				lock.Close()
+				return nil, err
+			}
+			return lock, nil
+		}
+		if !errors.Is(err, ErrDurableBusy) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

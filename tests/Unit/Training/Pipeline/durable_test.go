@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -417,6 +418,173 @@ func TestDurableRuntimeRecoversOutputBeforeReceiptCommit(t *testing.T) {
 		t.Fatal("recovered computation replayed")
 	}
 }
+
+func TestDurableRuntimeSharedCapacityWaitsForAllHandlersToStop(t *testing.T) {
+	for _, operation := range []string{"run", "reconcile"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			firstConfig, first, owner := durableFixture(root)
+			secondConfig, second, waiter := durableFixture(root)
+			second.RunID, second.TenantID = "other-run", "other-tenant"
+			secondConfig.Backend, second.Placement.Backend = "other-backend", "other-backend"
+			firstRuntime, secondRuntime := runtimeFixture(t, firstConfig), runtimeFixture(t, secondConfig)
+			// The waiter has already completed SFT. Its next computation would be
+			// teacher-cache work, using a different handler and runtime instance.
+			if err := secondRuntime.Run(context.Background(), second, func(context.Context, pipeline.Progress) error { return io.ErrClosedPipe }); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatal(err)
+			}
+			var active, overlap atomic.Bool
+			started, stopping, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			defer releaseOnce.Do(func() { close(release) })
+			owner.run = func(call context.Context, _ pipeline.StageContext, _ func(context.Context, pipeline.StageResult) error) error {
+				active.Store(true)
+				defer active.Store(false)
+				close(started)
+				<-call.Done()
+				close(stopping)
+				<-release // Model cleanup has not finished merely because ctx ended.
+				return call.Err()
+			}
+			ownerDone := make(chan error, 1)
+			go func() { ownerDone <- firstRuntime.Run(ctx, first, noReport) }()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("owner did not start")
+			}
+			entered := make(chan string, 16)
+			check := func(stage string) {
+				if active.Load() {
+					overlap.Store(true)
+				}
+				entered <- stage
+			}
+			waiter.verify = func(_ context.Context, c pipeline.StageContext, _ pipeline.StageReceipt) error {
+				check("verify:" + c.Stage.ID)
+				return nil
+			}
+			waiter.reconcile = func(_ context.Context, c pipeline.StageContext, _ func(context.Context, pipeline.StageResult) error) error {
+				check("reconcile:" + c.Stage.ID)
+				return nil
+			}
+			waiter.run = func(_ context.Context, c pipeline.StageContext, _ func(context.Context, pipeline.StageResult) error) error {
+				check("run:" + c.Stage.ID)
+				return io.ErrClosedPipe
+			}
+			waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer waitCancel()
+			waitDone := make(chan error, 1)
+			go func() {
+				if operation == "run" {
+					waitDone <- secondRuntime.Run(waitCtx, second, noReport)
+				} else {
+					_, err := secondRuntime.Reconcile(waitCtx, second)
+					waitDone <- err
+				}
+			}()
+			assertWaiting := func() {
+				t.Helper()
+				select {
+				case stage := <-entered:
+					t.Fatalf("handler entered occupied capacity: %s", stage)
+				case err := <-waitDone:
+					t.Fatalf("capacity contention returned instead of waiting: %v", err)
+				case <-time.After(75 * time.Millisecond):
+				}
+			}
+			assertWaiting()
+			// A waiting run already owns its own lock, preserving immediate
+			// duplicate-generation refusal rather than queueing a second waiter.
+			duplicate := second
+			duplicate.Generation++
+			duplicateCtx, duplicateCancel := context.WithTimeout(context.Background(), time.Second)
+			_, duplicateErr := secondRuntime.Reconcile(duplicateCtx, duplicate)
+			duplicateCancel()
+			if !errors.Is(duplicateErr, pipeline.ErrDurableBusy) {
+				t.Fatal("duplicate run waited for shared capacity", duplicateErr)
+			}
+			cancel()
+			select {
+			case <-stopping:
+			case <-time.After(5 * time.Second):
+				t.Fatal("owner did not begin shutdown")
+			}
+			assertWaiting()
+			releaseOnce.Do(func() { close(release) })
+			if err := <-ownerDone; !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if err := <-waitDone; operation == "run" && !errors.Is(err, io.ErrClosedPipe) || operation == "reconcile" && err != nil {
+				t.Fatal(err)
+			}
+			if overlap.Load() {
+				t.Fatal("different phase handlers overlapped")
+			}
+			var observed []string
+			for len(entered) > 0 {
+				observed = append(observed, <-entered)
+			}
+			if len(observed) < 2 || observed[0] != "verify:stage-0" || observed[1] != "reconcile:stage-1" {
+				t.Fatalf("waiter did not resume its exact next phase: %v", observed)
+			}
+		})
+	}
+}
+
+func TestDurableRuntimeCapacityWaitCancellationReleasesRunLock(t *testing.T) {
+	c, first, owner := durableFixture(t.TempDir())
+	r := runtimeFixture(t, c)
+	started := make(chan struct{})
+	owner.run = func(ctx context.Context, _ pipeline.StageContext, _ func(context.Context, pipeline.StageResult) error) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx, first, noReport) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owner did not start")
+	}
+	c2, second, h := durableFixture(c.Root)
+	second.RunID, second.TenantID = "waiting-run", "waiting-tenant"
+	r2 := runtimeFixture(t, c2)
+	var effects atomic.Int32
+	h.reconcile = func(context.Context, pipeline.StageContext, func(context.Context, pipeline.StageResult) error) error {
+		effects.Add(1)
+		return nil
+	}
+	for _, operation := range []string{"run", "reconcile"} {
+		wait, stop := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		var err error
+		if operation == "run" {
+			err = r2.Run(wait, second, noReport)
+		} else {
+			_, err = r2.Reconcile(wait, second)
+		}
+		stop()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s did not cancel its capacity wait: %v", operation, err)
+		}
+	}
+	if effects.Load() != 0 || len(h.calls) != 0 {
+		t.Fatal("waiting runtime called a handler")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if err := r2.Run(context.Background(), second, noReport); err != nil {
+		t.Fatal("cancelled waiter retained an OS lock", err)
+	}
+}
+
 func TestDurableRuntimeProcessExclusionAndCrashReleasesLock(t *testing.T) {
 	root := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -447,11 +615,36 @@ func TestDurableRuntimeProcessExclusionAndCrashReleasesLock(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), x); !errors.Is(err, pipeline.ErrDurableBusy) {
 		t.Fatal(err)
 	}
+	capacityBefore, err := os.Stat(filepath.Join(root, "execution.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherConfig, other, otherHandler := durableFixture(root)
+	other.RunID, other.TenantID = "another-run", "another-tenant"
+	otherRuntime := runtimeFixture(t, otherConfig)
+	var effects atomic.Int32
+	otherHandler.reconcile = func(context.Context, pipeline.StageContext, func(context.Context, pipeline.StageResult) error) error {
+		effects.Add(1)
+		return nil
+	}
+	wait, stop := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	_, waitErr := otherRuntime.Reconcile(wait, other)
+	stop()
+	if !errors.Is(waitErr, context.DeadlineExceeded) || effects.Load() != 0 {
+		t.Fatalf("cross-process capacity overlapped: %v calls=%d", waitErr, effects.Load())
+	}
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Fatal("helper unexpectedly exited successfully")
+	}
+	if err := otherRuntime.Run(ctx, other, noReport); err != nil {
+		t.Fatal("process death did not release shared capacity", err)
+	}
+	capacityAfter, err := os.Stat(filepath.Join(root, "execution.lock"))
+	if err != nil || !os.SameFile(capacityBefore, capacityAfter) {
+		t.Fatal("capacity lock inode was removed or replaced", err)
 	}
 	if _, err := r.Reconcile(context.Background(), x); err != nil {
 		t.Fatal(err)

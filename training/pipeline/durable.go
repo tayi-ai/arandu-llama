@@ -39,7 +39,11 @@ type DurableLimits struct {
 }
 
 // DurableConfig binds an installed backend and explicitly injected phase handlers.
-// Root must be a private local directory shared by every process for this runtime.
+// Root is one capacity domain: every runtime and worker using that capacity must
+// share this private local directory. Independent nodes or capacity domains may
+// use different roots only when their capacity owner explicitly assigns them.
+// The root lock serializes all handler effects across runs, tenants and backends;
+// it cannot protect against external processes that do not share this root.
 // External writers must not replace its lock files or alter committed artifacts.
 // Network filesystems are not supported. No field has an implicit default.
 type DurableConfig struct {
@@ -160,7 +164,8 @@ func (r *DurableRuntime) Admit(ctx context.Context, recipe Recipe, placement Pla
 	return nil
 }
 
-// Reconcile fences older generations and verifies all stored artifacts and receipts.
+// Reconcile waits cancelably for shared capacity, fences older generations and
+// verifies all stored artifacts and receipts while retaining both OS locks.
 // It also lets the next phase recover an output whose receipt commit was interrupted.
 func (r *DurableRuntime) Reconcile(ctx context.Context, execution Execution) (Progress, error) {
 	if err := r.Admit(ctx, execution.Recipe, execution.Placement); err != nil {
@@ -182,8 +187,11 @@ func (r *DurableRuntime) Reconcile(ctx context.Context, execution Execution) (Pr
 	return s.progress(), nil
 }
 
-// Run holds the process lock until all handlers stop. Each report follows a
-// verified, fsynced receipt, so a report failure resumes without replaying the step.
+// Run holds the run and shared capacity locks until all handlers stop. Contention
+// for this run fails immediately; contention for capacity waits until cancellation
+// or release, allowing the caller's lease monitor to remain active.
+// Each report follows a verified, fsynced receipt, so a report failure resumes
+// without replaying the step.
 func (r *DurableRuntime) Run(ctx context.Context, execution Execution, report func(context.Context, Progress) error) error {
 	if report == nil {
 		return ErrDurableConfiguration
