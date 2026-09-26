@@ -4,33 +4,98 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 
+	"github.com/tayi-ai/arandu-llama/training/fusioncache"
 	"github.com/tayi-ai/arandu-llama/training/pipeline"
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
 
-// TrainingBackend binds the complete objective to a loaded native student. Teachers
-// and Features must come from an identity-checked, teacher-forced cache. Prepare
-// installs sequence-specific rotary tables and returns their cleanup function.
-// It must not change parameters. This adapter owns no model or table lifetime.
+// TrainingAdmission independently binds a cache student identity to the loaded
+// assembly documents and initial adapter. These pins must come from the external
+// admitted manifest. Matching hashes alone does not qualify model execution.
+type TrainingAdmission struct {
+	Assembly AssemblyIdentity
+	Student  fusioncache.ModelIdentity
+}
+
+// TrainingBackend binds admitted signals to a loaded native student. Its fields
+// are private so raw teacher/feature arrays cannot bypass signal admission.
+// The caller must serialize model access and preserve the borrowed model owner.
 type TrainingBackend struct {
-	Loaded   *LoadedTextModel
-	Training pipeline.Example
-	Teachers []FusionTeacher
-	Features []FeatureTarget
-	Limits   Limits
-	Prepare  func(context.Context, int) (func() error, error)
+	loaded          *LoadedTextModel
+	training        pipeline.Example
+	teachers        []FusionTeacher
+	features        []FeatureTarget
+	limits          Limits
+	prepareSequence func(context.Context, int) (func() error, error)
+	admission       TrainingAdmission
+	admitted        bool
+}
+
+// NewTrainingBackend validates the independently admitted assembly and student
+// before converting immutable generic signals. Prepare may install rotary tables
+// only and must return cleanup; it must not mutate model parameters or identities.
+// This adapter owns neither model nor table lifetime and starts no execution.
+func NewTrainingBackend(loaded *LoadedTextModel, signals *pipeline.Signals, limits Limits, prepare func(context.Context, int) (func() error, error), admission TrainingAdmission) (*TrainingBackend, error) {
+	if loaded == nil || loaded.Model == nil || !signals.Admitted() || signals.Student() != admission.Student || loaded.Summary.Identity != admission.Assembly {
+		return nil, errors.New("pipeline: independently admitted assembly or student differs")
+	}
+	for _, hash := range []string{admission.Assembly.IndexSHA256, admission.Assembly.ConfigSHA256, admission.Assembly.ReferenceSHA256, admission.Assembly.InitialAdapterSHA256} {
+		if !validAssemblyHash(hash) {
+			return nil, errors.New("pipeline: external assembly identity required")
+		}
+	}
+	row := signals.Training()
+	if limits.MaxTokens < int64(len(row.Tokens)) || limits.MaxCheckpointBytes <= 0 || len(loaded.Parameters) == 0 || loaded.Model.Embedding == nil || loaded.Model.Head == nil {
+		return nil, errors.New("pipeline: invalid loaded geometry or training limits")
+	}
+	embedding, err := loaded.Model.Embedding.Info()
+	if err != nil {
+		return nil, err
+	}
+	head, err := loaded.Model.Head.Info()
+	if err != nil {
+		return nil, err
+	}
+	if len(embedding.Shape) != 2 || embedding.Shape[0] != int64(admission.Student.Vocabulary) || embedding.Shape[1] <= 0 || !slices.Equal(embedding.Shape, head.Shape) {
+		return nil, errors.New("pipeline: loaded vocabulary or hidden width differs")
+	}
+	result := &TrainingBackend{loaded: loaded, training: row, limits: limits, prepareSequence: prepare, admission: admission}
+	for _, teacher := range signals.Teachers() {
+		out := FusionTeacher{Name: teacher.Identity.Name, Weight: teacher.Weight}
+		for _, position := range teacher.Positions {
+			item := FusionTeacherPosition{RetainedMass: position.RetainedMass}
+			for _, probability := range position.Probabilities {
+				item.TopK = append(item.TopK, FusionTokenProbability{TokenID: probability.TokenID, Probability: probability.Probability})
+			}
+			out.Positions = append(out.Positions, item)
+		}
+		result.teachers = append(result.teachers, out)
+	}
+	for _, feature := range signals.Features() {
+		if feature.Target.Tensor != "decoder_output" || feature.Target.Layer < 0 || feature.Target.Layer >= len(loaded.Model.Layers) || int64(feature.Target.Dimension) != embedding.Shape[1] {
+			return nil, errors.New("pipeline: projected target differs from loaded decoder geometry")
+		}
+		result.features = append(result.features, FeatureTarget{Source: feature.Source, Layer: feature.Target.Layer, Position: feature.Position, Weight: feature.Weight, Values: slices.Clone(feature.Values)})
+	}
+	result.admitted = true
+	return result, nil
+}
+
+func (m *TrainingBackend) ready() bool {
+	return m != nil && m.admitted && m.loaded != nil && m.loaded.Model != nil && m.loaded.Summary.Identity == m.admission.Assembly
 }
 
 var _ pipeline.Model = (*TrainingBackend)(nil)
 
 // Parameters copies the exact FP32 registry used by the native gradient path.
 func (m *TrainingBackend) Parameters(ctx context.Context) ([]float32, error) {
-	if ctx == nil || m == nil || m.Loaded == nil || m.Loaded.Model == nil {
+	if ctx == nil || !m.ready() {
 		return nil, errors.New("pipeline: native model unavailable")
 	}
 	var values []float32
-	for _, parameter := range m.Loaded.Parameters {
+	for _, parameter := range m.loaded.Parameters {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -44,22 +109,31 @@ func (m *TrainingBackend) Parameters(ctx context.Context) ([]float32, error) {
 }
 
 func (m *TrainingBackend) prepare(ctx context.Context, row pipeline.Example) (Limits, func() error, error) {
-	if ctx == nil || m == nil || m.Loaded == nil || m.Loaded.Model == nil || row.PromptTokens < 1 || row.PromptTokens >= len(row.Tokens) ||
-		int64(len(row.Tokens)) > m.Limits.MaxTokens || m.Limits.MaxCheckpointBytes <= 0 {
+	if ctx == nil || !m.ready() || row.PromptTokens < 1 || row.PromptTokens >= len(row.Tokens) ||
+		int64(len(row.Tokens)) > m.limits.MaxTokens || m.limits.MaxCheckpointBytes <= 0 {
 		return Limits{}, nil, errors.New("pipeline: sequence outside admitted native bounds")
 	}
-	limits := m.Limits
+	if err := ctx.Err(); err != nil {
+		return Limits{}, nil, err
+	}
+	limits := m.limits
 	limits.LogitRows = int64(len(row.Tokens) - row.PromptTokens + 1)
 	close := func() error { return nil }
-	if m.Prepare != nil {
+	if m.prepareSequence != nil {
 		var err error
-		close, err = m.Prepare(ctx, len(row.Tokens))
+		close, err = m.prepareSequence(ctx, len(row.Tokens))
 		if err != nil {
+			if close != nil {
+				err = errors.Join(err, close())
+			}
 			return Limits{}, nil, err
 		}
 		if close == nil {
 			return Limits{}, nil, errors.New("pipeline: missing sequence cleanup")
 		}
+	}
+	if !m.ready() {
+		return Limits{}, nil, errors.Join(errors.New("pipeline: assembly identity changed during preparation"), close())
 	}
 	return limits, close, nil
 }
@@ -68,15 +142,15 @@ func (m *TrainingBackend) prepare(ctx context.Context, row pipeline.Example) (Li
 // The full method refuses a missing teacher or feature path instead of silently
 // continuing as ordinary SFT. Standalone SFT is a separate recipe phase.
 func (m *TrainingBackend) Objective(ctx context.Context) (result pipeline.Objective, err error) {
-	if m == nil || len(m.Teachers) == 0 || len(m.Features) == 0 {
+	if !m.ready() || len(m.teachers) == 0 || len(m.features) == 0 {
 		return result, errors.New("pipeline: fusion requires teacher and feature signals")
 	}
-	limits, close, err := m.prepare(ctx, m.Training)
+	limits, close, err := m.prepare(ctx, m.training)
 	if err != nil {
 		return result, err
 	}
 	defer func() { err = errors.Join(err, close()) }()
-	gradient, err := FusionCompletionGradientWithFeatures(ctx, m.Loaded.Model, m.Training.Tokens, m.Training.PromptTokens, limits, 1, m.Teachers, m.Features)
+	gradient, err := FusionCompletionGradientWithFeatures(ctx, m.loaded.Model, m.training.Tokens, m.training.PromptTokens, limits, 1, m.teachers, m.features)
 	if err != nil {
 		return result, err
 	}
@@ -89,6 +163,8 @@ func (m *TrainingBackend) Objective(ctx context.Context) (result pipeline.Object
 // rather than averages across answers of different lengths. Jacobians use the
 // same summed objective. Actual-candidate checks use forward only.
 func (m *TrainingBackend) Margin(ctx context.Context, pair pipeline.ProtectedPair, jacobian bool) (result pipeline.Margin, err error) {
+	pair.Positive.Tokens = slices.Clone(pair.Positive.Tokens)
+	pair.Negative.Tokens = slices.Clone(pair.Negative.Tokens)
 	if err := pipeline.ValidateProtectedPair(pair); err != nil {
 		return result, err
 	}
@@ -102,7 +178,7 @@ func (m *TrainingBackend) Margin(ctx context.Context, pair pipeline.ProtectedPai
 			sign = -1
 		}
 		if jacobian {
-			gradient, gradErr := CompletionGradient(ctx, m.Loaded.Model, row.Tokens, row.PromptTokens, limits, 1)
+			gradient, gradErr := CompletionGradient(ctx, m.loaded.Model, row.Tokens, row.PromptTokens, limits, 1)
 			closeErr := close()
 			if err := errors.Join(gradErr, closeErr); err != nil {
 				return pipeline.Margin{}, err
@@ -123,7 +199,7 @@ func (m *TrainingBackend) Margin(ctx context.Context, pair pipeline.ProtectedPai
 				}
 			}
 		} else {
-			value, scoreErr := scoreCompletion(ctx, m.Loaded.Model, row, limits)
+			value, scoreErr := scoreCompletion(ctx, m.loaded.Model, row, limits)
 			if err := errors.Join(scoreErr, close()); err != nil {
 				return pipeline.Margin{}, err
 			}
@@ -134,12 +210,12 @@ func (m *TrainingBackend) Margin(ctx context.Context, pair pipeline.ProtectedPai
 }
 
 func (m *TrainingBackend) flatten(gradients []CompletionParameterGradient, scale float64) ([]float64, error) {
-	if len(gradients) != len(m.Loaded.Parameters) {
+	if len(gradients) != len(m.loaded.Parameters) {
 		return nil, errors.New("pipeline: gradient registry differs")
 	}
 	var flat []float64
 	for i, part := range gradients {
-		parameter := m.Loaded.Parameters[i]
+		parameter := m.loaded.Parameters[i]
 		info, err := parameter.Value.Info()
 		if err != nil {
 			return nil, err
@@ -156,10 +232,10 @@ func (m *TrainingBackend) flatten(gradients []CompletionParameterGradient, scale
 
 // Install replaces the complete adapter atomically using the native registry.
 func (m *TrainingBackend) Install(ctx context.Context, values []float32) error {
-	if m == nil || m.Loaded == nil {
+	if !m.ready() {
 		return errors.New("pipeline: native model unavailable")
 	}
-	_, err := m.Loaded.ReplaceParameters(ctx, values)
+	_, err := m.loaded.ReplaceParameters(ctx, values)
 	return err
 }
 
