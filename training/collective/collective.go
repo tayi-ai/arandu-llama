@@ -1,7 +1,7 @@
 // Package collective gathers ordered FP32 gradients and broadcasts parameters
-// over connections supplied by an existing job. It never binds, dials, retries,
-// launches processes, or reduces gradients implicitly. HMAC authenticates the
-// fixed protocol; transport encryption and endpoint admission belong to callers.
+// over caller-supplied connections or explicitly configured TCP transport. It
+// never launches processes or reduces gradients implicitly. HMAC authenticates
+// the fixed protocol; transport encryption and endpoint admission belong to callers.
 package collective
 
 import (
