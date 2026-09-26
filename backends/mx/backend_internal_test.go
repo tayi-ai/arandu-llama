@@ -160,6 +160,8 @@ func TestModelAdmissionUsesConfiguredManifestAndFirstShard(t *testing.T) {
 	}
 	if _, err := backend.admittedModel(); err == nil || !strings.Contains(err.Error(), "manifest") {
 		t.Fatalf("mutated manifest refusal = %v", err)
+	} else if strings.Contains(err.Error(), model.Manifest) || strings.Contains(err.Error(), string(model.Recipe)) || strings.Contains(err.Error(), root) {
+		t.Fatal("manifest refusal exposed installation provenance")
 	}
 }
 
@@ -191,5 +193,41 @@ func testModel() MXModelIdentity {
 	return MXModelIdentity{
 		Recipe: "example-base", Repository: "example/model", Revision: strings.Repeat("a", 40),
 		Quantisation: "Q4_K_M", Manifest: strings.Repeat("a", 64), FirstShard: "model.gguf", Shards: 1,
+	}
+}
+
+func TestConfiguredModelCachesCannotSubstituteOneAnother(t *testing.T) {
+	models := []MXModelIdentity{testModel(), testModel()}
+	roots := []string{t.TempDir(), t.TempDir()}
+	for i := range models {
+		models[i].Recipe = MXModelRecipe(fmt.Sprintf("example-%d", i))
+		models[i].FirstShard = fmt.Sprintf("model-%d.gguf", i)
+		body := []byte(fmt.Sprintf("fixture manifest %d\n", i))
+		models[i].Manifest = fmt.Sprintf("%x", sha256.Sum256(body))
+		if err := os.WriteFile(filepath.Join(roots[i], "SHA256SUMS"), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(roots[i], models[i].FirstShard), []byte("GGUF"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalog, err := NewMXCatalog(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, model := range models {
+		selected, err := catalog.ModelFor(model.Recipe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend := &MXBackend{modelRoot: roots[i], model: selected}
+		got, err := backend.AdmittedModelPath()
+		if err != nil || got != filepath.Join(roots[i], model.FirstShard) {
+			t.Fatalf("own model cache: %q, %v", got, err)
+		}
+		backend.modelRoot = roots[1-i]
+		if _, err := backend.AdmittedModelPath(); err == nil || !strings.Contains(err.Error(), "manifest") {
+			t.Fatalf("other model cache was not rejected: %v", err)
+		}
 	}
 }

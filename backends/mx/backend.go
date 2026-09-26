@@ -36,13 +36,13 @@ type MXModelRecipe string
 // Applications provide it through their validated configuration, never from
 // an execution request. Runtime qualification is a separate identity.
 type MXModelIdentity struct {
-	Recipe       MXModelRecipe
-	Repository   string
-	Revision     string
-	Quantisation string
-	Manifest     string
-	FirstShard   string
-	Shards       int
+	Recipe       MXModelRecipe `json:"recipe"`
+	Repository   string        `json:"repository"`
+	Revision     string        `json:"revision"`
+	Quantisation string        `json:"quantisation"`
+	Manifest     string        `json:"manifest"`
+	FirstShard   string        `json:"first_shard"`
+	Shards       int           `json:"shards"`
 }
 
 // MXManifest identifies the source, build and executables admitted by this backend.
@@ -287,7 +287,7 @@ func (b *MXBackend) generateProcess(model string, in MXGenerateRequest) NativePr
 
 func (b *MXBackend) admittedModel() (string, error) {
 	if err := verifyFile(filepath.Join(b.modelRoot, "SHA256SUMS"), b.model.Manifest); err != nil {
-		return "", fmt.Errorf("llama: verify MX model manifest for %s: %w", b.model.Recipe, err)
+		return "", errors.New("llama: MX model manifest verification failed")
 	}
 	model := filepath.Join(b.modelRoot, b.model.FirstShard)
 	if info, err := os.Stat(model); err != nil || !info.Mode().IsRegular() {
