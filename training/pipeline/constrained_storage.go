@@ -25,20 +25,21 @@ import "github.com/tayi-ai/arandu-llama/checkpoint"
 // Parameters is stored separately as safetensors, so Receipt.Parameters is nil.
 // Verification establishes recorded consistency, not independent model execution.
 type ConstrainedEvidence struct {
-	Version               int             `json:"version"`
-	Identity              ReceiptIdentity `json:"identity"`
-	StageID               string          `json:"stage_id"`
-	Step                  int             `json:"step"`
-	ProtocolSHA256        string          `json:"protocol_sha256"`
-	UpdateSHA256          string          `json:"update_sha256"`
-	ParentSHA256          string          `json:"parent_sha256"`
-	PreviousSHA256        string          `json:"previous_sha256"`
-	PriorParametersSHA256 string          `json:"prior_parameters_sha256"`
-	ParametersSHA256      string          `json:"parameters_sha256"`
-	Parameters            StageArtifact   `json:"parameters"`
-	Intent                StageArtifact   `json:"intent"`
-	Prior                 []float32       `json:"prior"`
-	Receipt               StepReceipt     `json:"receipt"`
+	Version               int                  `json:"version"`
+	Identity              ReceiptIdentity      `json:"identity"`
+	StageID               string               `json:"stage_id"`
+	Step                  int                  `json:"step"`
+	ProtocolSHA256        string               `json:"protocol_sha256"`
+	UpdateSHA256          string               `json:"update_sha256"`
+	ParentSHA256          string               `json:"parent_sha256"`
+	PreviousSHA256        string               `json:"previous_sha256"`
+	PriorParametersSHA256 string               `json:"prior_parameters_sha256"`
+	ParametersSHA256      string               `json:"parameters_sha256"`
+	Parameters            StageArtifact        `json:"parameters"`
+	Intent                StageArtifact        `json:"intent"`
+	Prior                 []float32            `json:"prior"`
+	Receipt               StepReceipt          `json:"receipt"`
+	Bindings              *ConstrainedBindings `json:"bindings,omitempty"`
 }
 
 type constrainedState struct {
@@ -50,15 +51,16 @@ type constrainedState struct {
 }
 
 type constrainedIntent struct {
-	Version               int             `json:"version"`
-	Identity              ReceiptIdentity `json:"identity"`
-	StageID               string          `json:"stage_id"`
-	Step                  int             `json:"step"`
-	ProtocolSHA256        string          `json:"protocol_sha256"`
-	UpdateSHA256          string          `json:"update_sha256"`
-	ParentSHA256          string          `json:"parent_sha256"`
-	PreviousSHA256        string          `json:"previous_sha256"`
-	PriorParametersSHA256 string          `json:"prior_parameters_sha256"`
+	Version               int                  `json:"version"`
+	Identity              ReceiptIdentity      `json:"identity"`
+	StageID               string               `json:"stage_id"`
+	Step                  int                  `json:"step"`
+	ProtocolSHA256        string               `json:"protocol_sha256"`
+	UpdateSHA256          string               `json:"update_sha256"`
+	ParentSHA256          string               `json:"parent_sha256"`
+	PreviousSHA256        string               `json:"previous_sha256"`
+	PriorParametersSHA256 string               `json:"prior_parameters_sha256"`
+	Bindings              *ConstrainedBindings `json:"bindings,omitempty"`
 }
 
 func constrainedRoot(path string) (*os.Root, error) {
@@ -72,6 +74,14 @@ func constrainedRoot(path string) (*os.Root, error) {
 func (h *ConstrainedStage) sourceFiles(ctx context.Context, c StageContext, step int) ([]ConstrainedSourceFile, error) {
 	var files []ConstrainedSourceFile
 	for _, source := range h.config.Protocol.Updates[step-1].Sources {
+		if h.config.Protocol.Version == 2 {
+			file, err := ResolveArtifact(ctx, c, h.config.SourceDirectory, source.Binding, h.config.Protocol.Limits.MaxSourceBytes)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, ConstrainedSourceFile{Source: source, Path: file.Path, Artifact: file.Binding.Artifact, Binding: file.Binding})
+			continue
+		}
 		directory := h.config.SourceDirectory
 		if source.StageID != "" {
 			directory = c.ArtifactDirectory
@@ -99,9 +109,40 @@ func (h *ConstrainedStage) sourceFiles(ctx context.Context, c StageContext, step
 		if err != nil {
 			return nil, err
 		}
-		files = append(files, ConstrainedSourceFile{Source: source, Path: filepath.Join(directory, source.Artifact.Path)})
+		files = append(files, ConstrainedSourceFile{Source: source, Path: filepath.Join(directory, source.Artifact.Path), Artifact: source.Artifact})
 	}
 	return files, ctx.Err()
+}
+
+func (h *ConstrainedStage) resolvedInputs(ctx context.Context, c StageContext, step int) ([]ConstrainedSourceFile, ConstrainedInitialCheckpoint, *ConstrainedBindings, error) {
+	var initial ConstrainedInitialCheckpoint
+	files, err := h.sourceFiles(ctx, c, step)
+	if err != nil || h.config.Protocol.Version == 1 {
+		return files, initial, nil, err
+	}
+	p := h.config.Protocol
+	file, err := ResolveArtifact(ctx, c, h.config.SourceDirectory, p.InitialSource, p.Limits.MaxCheckpointBytes)
+	if err != nil {
+		return nil, initial, nil, err
+	}
+	root, err := constrainedRoot(c.ArtifactDirectory)
+	if err != nil {
+		return nil, initial, nil, err
+	}
+	values, readErr := h.readParameters(ctx, root, file.Binding.Artifact)
+	if err := errors.Join(readErr, root.Close()); err != nil {
+		return nil, initial, nil, err
+	}
+	parametersSHA, err := h.parameterSHA(values)
+	if err != nil {
+		return nil, initial, nil, err
+	}
+	initial = ConstrainedInitialCheckpoint{File: ConstrainedSourceFile{Source: ConstrainedSource{Binding: p.InitialSource}, Path: file.Path, Artifact: file.Binding.Artifact, Binding: file.Binding}, ParametersSHA256: parametersSHA}
+	b := &ConstrainedBindings{Initial: file.Binding, InitialParametersSHA256: parametersSHA}
+	for _, f := range files {
+		b.Sources = append(b.Sources, f.Binding)
+	}
+	return files, initial, b, ctx.Err()
 }
 
 // constrainedRead checks immutable regular files before allocating. retain=false
@@ -202,6 +243,17 @@ func (h *ConstrainedStage) scan(ctx context.Context, c StageContext) (constraine
 		if !hasIntent {
 			return state, ErrConstrained
 		}
+		var bindings *ConstrainedBindings
+		if h.config.Protocol.Version == 2 {
+			_, _, resolved, err := h.resolvedInputs(ctx, c, step)
+			if err != nil {
+				return state, err
+			}
+			bindings = resolved
+			if step == 1 {
+				priorSHA = bindings.InitialParametersSHA256
+			}
+		}
 		intentBody, err := constrainedRead(ctx, root, attempt, h.config.Protocol.Limits.MaxReceiptBytes, "", true)
 		if err != nil {
 			return state, err
@@ -213,7 +265,7 @@ func (h *ConstrainedStage) scan(ctx context.Context, c StageContext) (constraine
 			return state, ErrConstrained
 		}
 		intentCanonical, err := constrainedJSON(intent, h.config.Protocol.Limits.MaxReceiptBytes)
-		if err != nil || !bytes.Equal(intentCanonical, intentBody) || intent.Version != 1 || !sameIdentity(identity, intent.Identity) || intent.Identity.Generation == 0 || intent.Identity.Generation > identity.Generation || intent.Identity.Generation < generation ||
+		if err != nil || !bytes.Equal(intentCanonical, intentBody) || intent.Version != h.config.Protocol.Version || !reflect.DeepEqual(intent.Bindings, bindings) || !sameIdentity(identity, intent.Identity) || intent.Identity.Generation == 0 || intent.Identity.Generation > identity.Generation || intent.Identity.Generation < generation ||
 			intent.StageID != h.stage.ID || intent.Step != step || intent.ProtocolSHA256 != h.config.ProtocolSHA256 || intent.UpdateSHA256 != jsonSHA256(h.config.Protocol.Updates[i]) || intent.ParentSHA256 != c.Parent.SHA256 || intent.PreviousSHA256 != state.lastSHA || intent.PriorParametersSHA256 != priorSHA {
 			return state, ErrConstrained
 		}
@@ -237,7 +289,7 @@ func (h *ConstrainedStage) scan(ctx context.Context, c StageContext) (constraine
 			return state, ErrConstrained
 		}
 		canonical, err := constrainedJSON(evidence, h.config.Protocol.Limits.MaxReceiptBytes)
-		if err != nil || !bytes.Equal(canonical, body) || evidence.Version != 1 || !sameIdentity(identity, evidence.Identity) || evidence.Identity.Generation == 0 || evidence.Identity.Generation > identity.Generation || evidence.Identity.Generation < generation ||
+		if err != nil || !bytes.Equal(canonical, body) || evidence.Version != h.config.Protocol.Version || !reflect.DeepEqual(evidence.Bindings, bindings) || !sameIdentity(identity, evidence.Identity) || evidence.Identity.Generation == 0 || evidence.Identity.Generation > identity.Generation || evidence.Identity.Generation < generation ||
 			evidence.StageID != h.stage.ID || evidence.Step != step || evidence.ProtocolSHA256 != h.config.ProtocolSHA256 || evidence.UpdateSHA256 != jsonSHA256(h.config.Protocol.Updates[i]) ||
 			evidence.ParentSHA256 != c.Parent.SHA256 || evidence.PreviousSHA256 != state.lastSHA || evidence.PriorParametersSHA256 != priorSHA || !digest(evidence.ParametersSHA256) ||
 			evidence.Parameters.Path != filepath.Join(dir, "parameters.safetensors") || !constrainedArtifact(evidence.Parameters, h.config.Protocol.Limits.MaxCheckpointBytes) || evidence.Intent != intentArtifact || evidence.Identity != intent.Identity {
@@ -499,13 +551,13 @@ func (h *ConstrainedStage) persist(ctx context.Context, c StageContext, e Constr
 	return StageResult{Steps: int64(e.Step), Complete: e.Step == len(h.config.Protocol.Updates), Artifacts: []StageArtifact{e.Parameters, {Path: filepath.Join(h.stepDirectory(e.Step), "evidence.json"), SHA256: constrainedSHA(body), Bytes: int64(len(body))}, e.Intent}}, nil
 }
 
-func (h *ConstrainedStage) beginAttempt(ctx context.Context, c StageContext, step int, previousSHA, priorSHA string) (StageArtifact, error) {
+func (h *ConstrainedStage) beginAttempt(ctx context.Context, c StageContext, step int, previousSHA, priorSHA string, bindings *ConstrainedBindings) (StageArtifact, error) {
 	identity, err := h.stageIdentity(c)
 	if err != nil {
 		return StageArtifact{}, err
 	}
-	intent := constrainedIntent{Version: 1, Identity: identity, StageID: h.stage.ID, Step: step, ProtocolSHA256: h.config.ProtocolSHA256,
-		UpdateSHA256: jsonSHA256(h.config.Protocol.Updates[step-1]), ParentSHA256: c.Parent.SHA256, PreviousSHA256: previousSHA, PriorParametersSHA256: priorSHA}
+	intent := constrainedIntent{Version: h.config.Protocol.Version, Identity: identity, StageID: h.stage.ID, Step: step, ProtocolSHA256: h.config.ProtocolSHA256,
+		UpdateSHA256: jsonSHA256(h.config.Protocol.Updates[step-1]), ParentSHA256: c.Parent.SHA256, PreviousSHA256: previousSHA, PriorParametersSHA256: priorSHA, Bindings: bindings}
 	body, err := constrainedJSON(intent, h.config.Protocol.Limits.MaxReceiptBytes)
 	if err != nil {
 		return StageArtifact{}, err

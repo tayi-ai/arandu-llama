@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"slices"
 
 	"github.com/tayi-ai/arandu-llama/training/fusioncache"
 	"github.com/tayi-ai/arandu-llama/training/pipeline"
@@ -15,10 +14,18 @@ import (
 type state struct {
 	generations []uint64
 	artifacts   []pipeline.StageArtifact
+	intents     []pipeline.StageArtifact
 }
 
 func (s state) result(steps int, total int) pipeline.StageResult {
-	return pipeline.StageResult{Steps: int64(steps), Complete: steps == total, Artifacts: slices.Clone(s.artifacts[:steps])}
+	var artifacts []pipeline.StageArtifact
+	for i := 0; i < steps; i++ {
+		if s.intents[i].Bytes > 0 {
+			artifacts = append(artifacts, s.intents[i])
+		}
+		artifacts = append(artifacts, s.artifacts[i])
+	}
+	return pipeline.StageResult{Steps: int64(steps), Complete: steps == total, Artifacts: artifacts}
 }
 
 func (h *Stage) scan(ctx context.Context, c pipeline.StageContext) (state, error) {
@@ -39,6 +46,11 @@ func (h *Stage) scan(ctx context.Context, c pipeline.StageContext) (state, error
 		name := h.name(i + 1)
 		body, err := read(ctx, root, name, h.c.Protocol.Limits.MaxArtifactBytes, "")
 		if errors.Is(err, os.ErrNotExist) {
+			if h.c.Protocol.Version == 2 {
+				if _, intentErr := root.Lstat(h.intentName(i + 1)); !errors.Is(intentErr, os.ErrNotExist) {
+					return s, errors.Join(ErrAttempt, intentErr)
+				}
+			}
 			gap = true
 			continue
 		}
@@ -52,14 +64,15 @@ func (h *Stage) scan(ctx context.Context, c pipeline.StageContext) (state, error
 		if err != nil {
 			return s, err
 		}
-		if int64(len(body)) > h.c.Protocol.Limits.MaxTotalBytes-total {
+		if int64(len(body))+e.Intent.Bytes > h.c.Protocol.Limits.MaxTotalBytes-total {
 			return s, ErrContract
 		}
-		total += int64(len(body))
+		total += int64(len(body)) + e.Intent.Bytes
 		prior = bodySHA(body)
 		generation = e.Identity.Generation
 		s.generations = append(s.generations, e.Identity.Generation)
 		s.artifacts = append(s.artifacts, pipeline.StageArtifact{Path: name, SHA256: prior, Bytes: int64(len(body))})
+		s.intents = append(s.intents, e.Intent)
 	}
 	return s, ctx.Err()
 }
@@ -123,6 +136,11 @@ func (h *Stage) recover(ctx context.Context, c pipeline.StageContext, s state, c
 		if err := syncArtifact(root, s.artifacts[i].Path); err != nil {
 			return err
 		}
+		if s.intents[i].Bytes > 0 {
+			if err := syncArtifact(root, s.intents[i].Path); err != nil {
+				return err
+			}
+		}
 		if err := commit(ctx, s.result(i+1, len(h.c.Protocol.Fits))); err != nil {
 			return err
 		}
@@ -176,6 +194,27 @@ func (h *Stage) Run(ctx context.Context, c pipeline.StageContext, commit func(co
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		bound, err := h.binding(ctx, c, f)
+		if err != nil {
+			return err
+		}
+		fsha, _ := fusioncache.Digest(f)
+		prior := ""
+		if i > 0 {
+			prior = s.artifacts[i-1].SHA256
+		}
+		e := Evidence{Version: h.c.Protocol.Version, Identity: id, StageID: c.Stage.ID, Step: i + 1, ProtocolSHA256: h.c.ProtocolSHA256, FitSHA256: fsha, ParentSHA256: c.Parent.SHA256, PreviousSHA256: prior, Source: f.Source, Binding: bound}
+		if h.c.Protocol.Version == 2 {
+			body, err := boundedJSON(intentFor(e), h.c.Protocol.Limits.MaxArtifactBytes)
+			if err != nil {
+				return err
+			}
+			name := h.intentName(i + 1)
+			if err := writeAtomic(ctx, root, name, body); err != nil {
+				return errors.Join(ErrAttempt, err)
+			}
+			e.Intent = pipeline.StageArtifact{Path: name, SHA256: bodySHA(body), Bytes: int64(len(body))}
+		}
 		projection, report, err := fusioncache.FitProjection(f.MatchingPlan, f.MatchingPlanSHA256, samples.Fit, samples.Heldout, h.c.Protocol.Limits.Projection)
 		if err != nil {
 			return err
@@ -187,12 +226,7 @@ func (h *Stage) Run(ctx context.Context, c pipeline.StageContext, commit func(co
 		if err != nil || measured != report {
 			return errors.Join(ErrContract, err)
 		}
-		fsha, _ := fusioncache.Digest(f)
-		prior := ""
-		if i > 0 {
-			prior = s.artifacts[i-1].SHA256
-		}
-		e := Evidence{Version: 1, Identity: id, StageID: c.Stage.ID, Step: i + 1, ProtocolSHA256: h.c.ProtocolSHA256, FitSHA256: fsha, ParentSHA256: c.Parent.SHA256, PreviousSHA256: prior, Source: f.Source, Projection: projection, Report: report}
+		e.Projection, e.Report = projection, report
 		body, err := boundedJSON(e, h.c.Protocol.Limits.MaxArtifactBytes)
 		if err != nil {
 			return err
@@ -203,6 +237,7 @@ func (h *Stage) Run(ctx context.Context, c pipeline.StageContext, commit func(co
 		}
 		s.generations = append(s.generations, e.Identity.Generation)
 		s.artifacts = append(s.artifacts, pipeline.StageArtifact{Path: name, SHA256: bodySHA(body), Bytes: int64(len(body))})
+		s.intents = append(s.intents, e.Intent)
 		if err := ctx.Err(); err != nil {
 			return err
 		}

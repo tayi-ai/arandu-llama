@@ -37,11 +37,13 @@ type ConstrainedTensor struct {
 // ReceiptSHA256 identify a completed predecessor containing Artifact verbatim.
 // External input artifacts are resolved under ConstrainedConfig.SourceDirectory.
 // Predecessor artifacts are resolved under StageContext.ArtifactDirectory.
+// V2 supplies only Binding; v1 retains the original fields and byte identity.
 type ConstrainedSource struct {
-	Artifact      StageArtifact `json:"artifact"`
-	Input         ArtifactRef   `json:"input"`
-	StageID       string        `json:"stage_id"`
-	ReceiptSHA256 string        `json:"receipt_sha256"`
+	Artifact      StageArtifact   `json:"artifact"`
+	Input         ArtifactRef     `json:"input"`
+	StageID       string          `json:"stage_id"`
+	ReceiptSHA256 string          `json:"receipt_sha256"`
+	Binding       ArtifactBinding `json:"binding,omitzero"`
 }
 
 // ConstrainedUpdate fixes one objective's immutable sources and solver policy.
@@ -69,6 +71,8 @@ type ConstrainedLimits struct {
 // ConstrainedProtocol freezes all numerical choices without scientific defaults.
 // InitialParametersSHA256 and subsequent parameter hashes use ordered UTF-8
 // names followed by each tensor's little-endian FP32 values, as decoder does.
+// V2 instead resolves InitialSource from the verified predecessor and persists
+// its actual parameter hash before computing. It does not predict future bytes.
 type ConstrainedProtocol struct {
 	Version                    int                 `json:"version"`
 	RecipeSHA256               string              `json:"recipe_sha256"`
@@ -76,6 +80,7 @@ type ConstrainedProtocol struct {
 	FactoryQualificationSHA256 string              `json:"factory_qualification_sha256"`
 	StageID                    string              `json:"stage_id"`
 	InitialParametersSHA256    string              `json:"initial_parameters_sha256"`
+	InitialSource              ArtifactBinding     `json:"initial_source,omitzero"`
 	Layout                     []ConstrainedTensor `json:"layout"`
 	Updates                    []ConstrainedUpdate `json:"updates"`
 	Limits                     ConstrainedLimits   `json:"limits"`
@@ -98,8 +103,25 @@ func (p ConstrainedProtocol) Digest() (string, error) {
 // Factory must consume the pinned bytes, checking SHA while reading; a path is
 // not a snapshot. Sources must remain immutable for this stage's lifetime.
 type ConstrainedSourceFile struct {
-	Source ConstrainedSource
-	Path   string
+	Source   ConstrainedSource
+	Path     string
+	Artifact StageArtifact
+	Binding  BoundArtifact
+}
+
+// ConstrainedInitialCheckpoint is resolved and hashed before numerical work.
+// The concrete factory must load this file; it cannot substitute an initializer.
+type ConstrainedInitialCheckpoint struct {
+	File             ConstrainedSourceFile
+	ParametersSHA256 string
+}
+
+// ConstrainedBindings is persisted in v2 intent and evidence before the factory
+// opens a model. V1 receipts omit it and preserve their original JSON identity.
+type ConstrainedBindings struct {
+	Initial                 BoundArtifact   `json:"initial"`
+	InitialParametersSHA256 string          `json:"initial_parameters_sha256"`
+	Sources                 []BoundArtifact `json:"sources"`
 }
 
 // ConstrainedRequest identifies one serialized model session. Parameters is nil
@@ -112,6 +134,7 @@ type ConstrainedRequest struct {
 	Step       int
 	Parameters []float32
 	Sources    []ConstrainedSourceFile
+	Initial    ConstrainedInitialCheckpoint
 }
 
 // ConstrainedSession owns one concrete Model and all resources backing it.
@@ -194,6 +217,20 @@ func (h *ConstrainedStage) Admit(ctx context.Context, recipe Recipe, stage Stage
 		!digest(placement.RuntimeSHA256) || !identifier(placement.Backend) || placement.MemoryBytes <= 0 || stage.MaxTokens > placement.MaxTokens {
 		return errors.Join(ErrConstrained, err)
 	}
+	if p.Version == 2 {
+		if err := p.InitialSource.Validate(recipe, stage, p.Limits.MaxCheckpointBytes); err != nil {
+			return err
+		}
+		var origin Stage
+		for _, s := range recipe.Stages {
+			if s.ID == p.InitialSource.Predecessor.StageID {
+				origin = s
+			}
+		}
+		if (stage.Phase == PhaseFusion && origin.Phase != PhaseSFT) || (stage.Phase == PhaseRecovery && origin.Phase != PhaseFusion) || (stage.Phase == PhaseVariantRecovery && (origin.Phase != PhaseQuantize || origin.Format != stage.Format)) {
+			return ErrConstrained
+		}
+	}
 	for _, update := range p.Updates {
 		for _, pair := range update.Config.Protection {
 			if pair.Positive.DatasetDigest != recipe.Protection.SHA256 || len(pair.Positive.Tokens) > stage.MaxTokens || len(pair.Negative.Tokens) > stage.MaxTokens {
@@ -201,6 +238,21 @@ func (h *ConstrainedStage) Admit(ctx context.Context, recipe Recipe, stage Stage
 			}
 		}
 		for _, source := range update.Sources {
+			if p.Version == 2 {
+				if err := source.Binding.Validate(recipe, stage, p.Limits.MaxSourceBytes); err != nil {
+					return err
+				}
+				if source.Binding.Kind == BindingDerivedInput {
+					data := recipe.Training
+					if stage.Phase != PhaseFusion {
+						data = recipe.Recovery
+					}
+					if source.Binding.Input != data {
+						return ErrConstrained
+					}
+				}
+				continue
+			}
 			if source.StageID == "" {
 				if !slices.Contains(stage.Inputs, source.Input) || source.Input.SHA256 != source.Artifact.SHA256 {
 					return ErrConstrained
@@ -227,13 +279,20 @@ func (h *ConstrainedStage) Admit(ctx context.Context, recipe Recipe, stage Stage
 func (p ConstrainedProtocol) validate() (int, error) {
 	l := p.Limits
 	c := l.Checkpoint
-	if p.Version != 1 || !digest(p.RecipeSHA256) || !digest(p.PlacementSHA256) || !digest(p.FactoryQualificationSHA256) || !identifier(p.StageID) || !digest(p.InitialParametersSHA256) ||
+	if (p.Version != 1 && p.Version != 2) || !digest(p.RecipeSHA256) || !digest(p.PlacementSHA256) || !digest(p.FactoryQualificationSHA256) || !identifier(p.StageID) ||
 		l.MaxProtocolBytes < 1 || l.MaxProtocolBytes > 64<<20 || l.MaxReceiptBytes < 1 || l.MaxReceiptBytes > 256<<20 ||
 		l.MaxCheckpointBytes < 1 || l.MaxCheckpointBytes > 1<<40 || l.MaxSourceBytes < 1 || l.MaxSourceBytes > 1<<40 ||
 		l.MaxParameters < 1 || l.MaxParameters > 1<<20 || l.MaxSteps < 1 || l.MaxSteps > 1_000_000 || len(p.Updates) < 1 || len(p.Updates) > l.MaxSteps ||
 		c.MaxHeaderBytes < 1 || c.MaxHeaderBytes > 100_000_000 || c.MaxTensors < 1 || c.MaxTensors > 65536 || c.MaxDimensions < 1 || c.MaxDimensions > 32 ||
 		c.MaxMetadataEntries < 1 || c.MaxChunkBytes < 4 || c.MaxChunkBytes > 4<<20 || len(p.Layout) < 1 || len(p.Layout) > c.MaxTensors ||
 		l.MaxTotalBytes < l.MaxCheckpointBytes+2*l.MaxReceiptBytes || int64(len(p.Updates)) > l.MaxTotalBytes/(l.MaxCheckpointBytes+2*l.MaxReceiptBytes) {
+		return 0, ErrConstrained
+	}
+	if p.Version == 1 {
+		if !digest(p.InitialParametersSHA256) || p.InitialSource != (ArtifactBinding{}) {
+			return 0, ErrConstrained
+		}
+	} else if p.InitialParametersSHA256 != "" || p.InitialSource.Kind != BindingPredecessor || p.InitialSource.Predecessor.Schema != "adapter-safetensors-v1" || p.InitialSource.validate(l.MaxCheckpointBytes) != nil {
 		return 0, ErrConstrained
 	}
 	n := 0
@@ -275,6 +334,22 @@ func (p ConstrainedProtocol) validate() (int, error) {
 		var total int64
 		paths := map[string]bool{}
 		for _, source := range update.Sources {
+			if p.Version == 2 {
+				b := source.Binding
+				if source != (ConstrainedSource{Binding: b}) || b.validate(l.MaxSourceBytes) != nil || b.ByteLimit() > l.MaxSourceBytes-total {
+					return 0, ErrConstrained
+				}
+				total += b.ByteLimit()
+				key := b.Kind + "/" + b.Predecessor.StageID + "/" + b.Predecessor.Path + "/" + b.Artifact.Path
+				if paths[key] {
+					return 0, ErrConstrained
+				}
+				paths[key] = true
+				continue
+			}
+			if source.Binding != (ArtifactBinding{}) {
+				return 0, ErrConstrained
+			}
 			a := source.Artifact
 			if !constrainedArtifact(a, l.MaxSourceBytes) || a.Bytes > l.MaxSourceBytes-total {
 				return 0, ErrConstrained

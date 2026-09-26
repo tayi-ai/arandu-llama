@@ -33,6 +33,30 @@ type Evidence struct {
 	Source         Source                   `json:"source"`
 	Projection     fusioncache.Projection   `json:"projection"`
 	Report         fusioncache.FitReport    `json:"report"`
+	Binding        pipeline.BoundArtifact   `json:"binding,omitzero"`
+	Intent         pipeline.StageArtifact   `json:"intent,omitzero"`
+}
+
+type alignmentIntent struct {
+	Version        int                      `json:"version"`
+	Identity       pipeline.ReceiptIdentity `json:"identity"`
+	StageID        string                   `json:"stage_id"`
+	Step           int                      `json:"step"`
+	ProtocolSHA256 string                   `json:"protocol_sha256"`
+	FitSHA256      string                   `json:"fit_sha256"`
+	ParentSHA256   string                   `json:"parent_sha256"`
+	PreviousSHA256 string                   `json:"previous_sha256"`
+	Binding        pipeline.BoundArtifact   `json:"binding"`
+}
+
+var ErrAttempt = errors.New("alignment: unresolved attempt requires review")
+
+func (h *Stage) binding(ctx context.Context, c pipeline.StageContext, f Fit) (pipeline.BoundArtifact, error) {
+	if h.c.Protocol.Version == 1 {
+		return pipeline.BoundArtifact{}, nil
+	}
+	file, err := pipeline.ResolveArtifact(ctx, c, h.c.SourceDirectory, f.Source.Binding, h.c.Protocol.Limits.MaxSourceBytes)
+	return file.Binding, err
 }
 
 func rooted(path string) (*os.Root, error) {
@@ -164,7 +188,17 @@ func (h *Stage) source(ctx context.Context, c pipeline.StageContext, f Fit) (Sam
 	}
 	s := f.Source
 	dir := h.c.SourceDirectory
-	if s.StageID != "" {
+	artifact := s.Artifact
+	if h.c.Protocol.Version == 2 {
+		bound, err := h.binding(ctx, c, f)
+		if err != nil {
+			return samples, err
+		}
+		artifact = bound.Artifact
+		if s.Binding.Kind == pipeline.BindingPredecessor {
+			dir = c.ArtifactDirectory
+		}
+	} else if s.StageID != "" {
 		dir = c.ArtifactDirectory
 		found := false
 		for _, r := range c.Completed {
@@ -181,7 +215,7 @@ func (h *Stage) source(ctx context.Context, c pipeline.StageContext, f Fit) (Sam
 		return samples, err
 	}
 	defer root.Close()
-	body, err := read(ctx, root, s.Artifact.Path, s.Artifact.Bytes, s.Artifact.SHA256)
+	body, err := read(ctx, root, artifact.Path, artifact.Bytes, artifact.SHA256)
 	if err != nil {
 		return samples, err
 	}
@@ -217,6 +251,14 @@ func (h *Stage) source(ctx context.Context, c pipeline.StageContext, f Fit) (Sam
 }
 
 func (h *Stage) name(step int) string { return fmt.Sprintf("alignment-%s-%06d.json", h.stage.ID, step) }
+
+func (h *Stage) intentName(step int) string {
+	return strings.TrimSuffix(h.name(step), ".json") + "-intent.json"
+}
+
+func intentFor(e Evidence) alignmentIntent {
+	return alignmentIntent{Version: 2, Identity: e.Identity, StageID: e.StageID, Step: e.Step, ProtocolSHA256: e.ProtocolSHA256, FitSHA256: e.FitSHA256, ParentSHA256: e.ParentSHA256, PreviousSHA256: e.PreviousSHA256, Binding: e.Binding}
+}
 
 // Link publishes a complete synced file without replacing an existing result.
 // Interrupted temporary files are not evidence and never enter the receipt.
@@ -276,8 +318,33 @@ func (h *Stage) verifyEvidence(ctx context.Context, c pipeline.StageContext, ste
 	f := h.c.Protocol.Fits[step-1]
 	fsha, _ := fusioncache.Digest(f)
 	canonical, err := boundedJSON(e, h.c.Protocol.Limits.MaxArtifactBytes)
-	if err != nil || !bytes.Equal(canonical, body) || e.Version != 1 || !sameIdentity(e.Identity, id) || e.Identity.Generation == 0 || e.Identity.Generation > id.Generation || e.Identity.Generation < generation || e.StageID != c.Stage.ID || e.Step != step || e.ProtocolSHA256 != h.c.ProtocolSHA256 || e.FitSHA256 != fsha || e.ParentSHA256 != c.Parent.SHA256 || e.PreviousSHA256 != prior || e.Source != f.Source {
+	if err != nil || !bytes.Equal(canonical, body) || e.Version != h.c.Protocol.Version || !sameIdentity(e.Identity, id) || e.Identity.Generation == 0 || e.Identity.Generation > id.Generation || e.Identity.Generation < generation || e.StageID != c.Stage.ID || e.Step != step || e.ProtocolSHA256 != h.c.ProtocolSHA256 || e.FitSHA256 != fsha || e.ParentSHA256 != c.Parent.SHA256 || e.PreviousSHA256 != prior || e.Source != f.Source {
 		return e, ErrContract
+	}
+	bound, err := h.binding(ctx, c, f)
+	if err != nil || e.Binding != bound {
+		return e, errors.Join(ErrContract, err)
+	}
+	if h.c.Protocol.Version == 1 {
+		if e.Intent != (pipeline.StageArtifact{}) {
+			return e, ErrContract
+		}
+	} else {
+		if e.Intent.Path != h.intentName(step) || !artifactValid(e.Intent, h.c.Protocol.Limits.MaxArtifactBytes) {
+			return e, ErrContract
+		}
+		root, err := rooted(c.ArtifactDirectory)
+		if err != nil {
+			return e, err
+		}
+		intentBody, readErr := read(ctx, root, e.Intent.Path, e.Intent.Bytes, e.Intent.SHA256)
+		if err := errors.Join(readErr, root.Close()); err != nil {
+			return e, err
+		}
+		want, err := boundedJSON(intentFor(e), h.c.Protocol.Limits.MaxArtifactBytes)
+		if err != nil || !bytes.Equal(intentBody, want) {
+			return e, ErrContract
+		}
 	}
 	samples, err := h.source(ctx, c, f)
 	if err != nil {

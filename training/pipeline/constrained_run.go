@@ -44,26 +44,30 @@ func (h *ConstrainedStage) Run(ctx context.Context, c StageContext, commit func(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		files, err := h.sourceFiles(ctx, c, step)
+		files, initial, bindings, err := h.resolvedInputs(ctx, c, step)
 		if err != nil {
 			return err
 		}
 		priorSHA := h.config.Protocol.InitialParametersSHA256
+		if bindings != nil {
+			priorSHA = bindings.InitialParametersSHA256
+		}
 		if step > 1 {
 			priorSHA = state.last.ParametersSHA256
 		}
-		intent, err := h.beginAttempt(ctx, c, step, state.lastSHA, priorSHA)
+		intent, err := h.beginAttempt(ctx, c, step, state.lastSHA, priorSHA, bindings)
 		if err != nil {
 			return err
 		}
-		prior, receipt, err := h.compute(ctx, c, step, state.parameters, priorSHA, files)
+		prior, receipt, err := h.compute(ctx, c, step, state.parameters, priorSHA, files, initial)
 		if err != nil {
 			return err
 		}
 		// Detect changed inputs before accepting any durable model output. The
 		// qualified Factory additionally verifies bytes during its own reads.
-		if _, err := h.sourceFiles(ctx, c, step); err != nil {
-			return err
+		_, _, afterBindings, err := h.resolvedInputs(ctx, c, step)
+		if err != nil || !reflect.DeepEqual(bindings, afterBindings) {
+			return errors.Join(ErrConstrained, err)
 		}
 		parametersSHA, err := h.parameterSHA(receipt.Parameters)
 		if err != nil {
@@ -71,9 +75,9 @@ func (h *ConstrainedStage) Run(ctx context.Context, c StageContext, commit func(
 		}
 		parameters := receipt.Parameters
 		receipt.Parameters = nil
-		evidence := ConstrainedEvidence{Version: 1, Identity: identity, StageID: h.stage.ID, Step: step,
+		evidence := ConstrainedEvidence{Version: h.config.Protocol.Version, Identity: identity, StageID: h.stage.ID, Step: step,
 			ProtocolSHA256: h.config.ProtocolSHA256, UpdateSHA256: jsonSHA256(h.config.Protocol.Updates[step-1]), ParentSHA256: c.Parent.SHA256,
-			PreviousSHA256: state.lastSHA, PriorParametersSHA256: priorSHA, ParametersSHA256: parametersSHA, Intent: intent, Prior: prior, Receipt: receipt}
+			PreviousSHA256: state.lastSHA, PriorParametersSHA256: priorSHA, ParametersSHA256: parametersSHA, Intent: intent, Prior: prior, Receipt: receipt, Bindings: bindings}
 		result, err := h.persist(ctx, c, evidence, parameters)
 		if err != nil {
 			return err
@@ -159,8 +163,8 @@ func (h *ConstrainedStage) previous(c StageContext, state constrainedState) (int
 	return previous, nil
 }
 
-func (h *ConstrainedStage) compute(ctx context.Context, c StageContext, step int, parameters []float32, expected string, sources []ConstrainedSourceFile) (prior []float32, receipt StepReceipt, err error) {
-	session, factoryErr := h.config.Factory(ctx, ConstrainedRequest{Context: constrainedContext(c), Step: step, Parameters: slices.Clone(parameters), Sources: slices.Clone(sources)})
+func (h *ConstrainedStage) compute(ctx context.Context, c StageContext, step int, parameters []float32, expected string, sources []ConstrainedSourceFile, initial ConstrainedInitialCheckpoint) (prior []float32, receipt StepReceipt, err error) {
+	session, factoryErr := h.config.Factory(ctx, ConstrainedRequest{Context: constrainedContext(c), Step: step, Parameters: slices.Clone(parameters), Sources: slices.Clone(sources), Initial: initial})
 	if session.Close != nil {
 		defer func() { err = errors.Join(err, session.Close()) }()
 	}

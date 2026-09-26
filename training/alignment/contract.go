@@ -26,11 +26,13 @@ var ErrContract = errors.New("alignment: stage contract refused")
 // Stage.Inputs; Artifact independently pins the derived Samples document through
 // the frozen Protocol. Every sample must belong to that Input. Alternatively,
 // StageID and ReceiptSHA256 pin a completed predecessor containing Artifact.
+// V2 supplies only Binding, resolving the actual producer output at execution.
 type Source struct {
-	Artifact      pipeline.StageArtifact `json:"artifact"`
-	Input         pipeline.ArtifactRef   `json:"input"`
-	StageID       string                 `json:"stage_id"`
-	ReceiptSHA256 string                 `json:"receipt_sha256"`
+	Artifact      pipeline.StageArtifact   `json:"artifact"`
+	Input         pipeline.ArtifactRef     `json:"input"`
+	StageID       string                   `json:"stage_id"`
+	ReceiptSHA256 string                   `json:"receipt_sha256"`
+	Binding       pipeline.ArtifactBinding `json:"binding,omitzero"`
 }
 
 // Samples retains both numerical and causal provenance. Heldout is a disjoint
@@ -195,6 +197,14 @@ func (h *Stage) Admit(ctx context.Context, recipe pipeline.Recipe, stage pipelin
 		if !teacher {
 			return ErrContract
 		}
+		if p.Version == 2 {
+			if err := f.Source.Binding.Validate(recipe, stage, p.Limits.MaxSourceBytes); err != nil {
+				return err
+			}
+			if f.Source.Binding.Kind == pipeline.BindingPredecessor && f.Source.Binding.Predecessor.Schema != "alignment-samples-v1" {
+				return ErrContract
+			}
+		}
 		for _, ids := range [][]fusioncache.SampleIdentity{plan.Fit, plan.Heldout} {
 			for _, id := range ids {
 				ref := recipe.Training
@@ -206,7 +216,13 @@ func (h *Stage) Admit(ctx context.Context, recipe pipeline.Recipe, stage pipelin
 				if id.DatasetSHA256 != ref.SHA256 || !slices.Contains(stage.Inputs, ref) || id.TargetIndex >= stage.MaxTokens {
 					return ErrContract
 				}
+				if p.Version == 2 && f.Source.Binding.Kind == pipeline.BindingDerivedInput && f.Source.Binding.Input != ref {
+					return ErrContract
+				}
 			}
+		}
+		if p.Version == 2 {
+			continue
 		}
 		if f.Source.StageID == "" {
 			if !slices.Contains(stage.Inputs, f.Source.Input) || (f.Source.Input != recipe.Training && f.Source.Input != recipe.Calibration) {
@@ -245,7 +261,11 @@ func (h *Stage) residentReservation() int64 {
 	l := h.c.Protocol.Limits
 	var sourceBytes int64
 	for _, f := range h.c.Protocol.Fits {
-		sourceBytes = max(sourceBytes, f.Source.Artifact.Bytes)
+		b := f.Source.Artifact.Bytes
+		if h.c.Protocol.Version == 2 {
+			b = f.Source.Binding.ByteLimit()
+		}
+		sourceBytes = max(sourceBytes, b)
 	}
 	return 8<<20 + 16*l.MaxProtocolBytes + 128*sourceBytes + 128*l.MaxArtifactBytes + 32*l.Projection.MaxElements + int64(len(h.c.Protocol.Fits))*256
 }
@@ -253,11 +273,14 @@ func (h *Stage) residentReservation() int64 {
 func (p Protocol) validate() error {
 	l := p.Limits
 	x := l.Projection
-	if p.Version != 1 || !validSHA(p.RecipeSHA256) || !validSHA(p.PlacementSHA256) || !validSHA(p.QualificationSHA256) || !identifier(p.StageID) ||
+	if (p.Version != 1 && p.Version != 2) || !validSHA(p.RecipeSHA256) || !validSHA(p.PlacementSHA256) || !validSHA(p.QualificationSHA256) || !identifier(p.StageID) ||
 		l.MaxProtocolBytes < 1 || l.MaxProtocolBytes > 64<<20 || l.MaxSourceBytes < 1 || l.MaxSourceBytes > 256<<20 ||
 		l.MaxArtifactBytes < 1 || l.MaxArtifactBytes > 256<<20 || l.MaxTotalBytes < l.MaxArtifactBytes ||
 		l.MaxFits < 1 || l.MaxFits > 4096 || len(p.Fits) < 1 || len(p.Fits) > l.MaxFits || int64(len(p.Fits)) > l.MaxTotalBytes/l.MaxArtifactBytes ||
 		l.MaxSolveWork < 1 || l.MaxSolveWork > 1_000_000_000 || x.MaxSamples < 2 || x.MaxSamples > 1<<20 || x.MaxDimension < 1 || x.MaxDimension > 1<<20 || x.MaxElements < 1 || x.MaxElements > 1<<26 {
+		return ErrContract
+	}
+	if p.Version == 2 && (len(p.Fits) > 2048 || int64(len(p.Fits)) > l.MaxTotalBytes/(2*l.MaxArtifactBytes)) {
 		return ErrContract
 	}
 	seen := map[string]bool{}
@@ -300,6 +323,15 @@ func (p Protocol) validate() error {
 			return ErrContract
 		}
 		s := f.Source
+		if p.Version == 2 {
+			if s != (Source{Binding: s.Binding}) || s.Binding.ValidateBounds(l.MaxSourceBytes) != nil {
+				return ErrContract
+			}
+			continue
+		}
+		if s.Binding != (pipeline.ArtifactBinding{}) {
+			return ErrContract
+		}
 		if !artifactValid(s.Artifact, l.MaxSourceBytes) {
 			return ErrContract
 		}
