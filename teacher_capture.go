@@ -28,7 +28,7 @@ import (
 
 // TeacherCaptureVersion identifies full-row gold-prefix decoding, FP32 graph
 // features, full-vocabulary Float64 softmax and deterministic top-k tie order.
-const TeacherCaptureVersion = "arandu-llama.teacher-forced.v1/llama.cpp.90c26fcd"
+const TeacherCaptureVersion = "arandu-llama.teacher-forced.v2/llama.cpp.90c26fcd"
 
 // TeacherModel owns verified, adapter-free teacher weights. Close releases the
 // weights before loading another teacher; captures on one model are serialized.
@@ -338,10 +338,11 @@ func (m *TeacherModel) CaptureTeacherForced(tokens, positions []int32, options T
 
 // The native softmax denominator and retained probabilities are accumulated in
 // different orders. At full vocabulary, rounding can put the mass just above
-// one. Bound only this metadata within the cache's 1e-10 sum-check tolerance;
-// individual probabilities remain unchanged and larger discrepancies fail.
+// one. Bound the retained scalar within the cache's 1e-10 sum-check tolerance
+// so residual target mass stays nonnegative. Individual probabilities remain
+// unchanged; the cache checks their sum against this final scalar separately.
 func boundedTeacherMass(mass float64) (float64, error) {
-	if math.IsNaN(mass) || math.IsInf(mass, 0) || mass < 0 || mass > 1+1e-10 {
+	if math.IsNaN(mass) || math.IsInf(mass, 0) || mass < 0 || mass-1 > 1e-10 {
 		return 0, errors.New("teacher capture: invalid retained probability mass")
 	}
 	return math.Min(mass, 1), nil

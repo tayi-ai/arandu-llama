@@ -13,13 +13,13 @@ func TestTeacherMassAcceptsOnlyBoundedSummationRoundoff(t *testing.T) {
 		}
 	}
 	// Different accumulation orders can exceed one even with a complete softmax.
-	for _, mass := range []float64{math.Nextafter(1, 2), 1 + 5e-11} {
+	for _, mass := range []float64{math.Nextafter(1, 2), 1 + 5e-11, math.Nextafter(1+1e-10, 1)} {
 		got, err := boundedTeacherMass(mass)
 		if err != nil || got != 1 {
 			t.Fatalf("bounded rounding %.17g was not canonicalized: %v", mass, err)
 		}
 	}
-	for _, mass := range []float64{-math.SmallestNonzeroFloat64, 1 + 2e-10, 2, math.NaN(), math.Inf(1), math.Inf(-1)} {
+	for _, mass := range []float64{-math.SmallestNonzeroFloat64, 1 + 1e-10, math.Nextafter(1+1e-10, 2), 2, math.NaN(), math.Inf(1), math.Inf(-1)} {
 		if _, err := boundedTeacherMass(mass); err == nil {
 			t.Fatalf("invalid mass %.17g accepted", mass)
 		}
