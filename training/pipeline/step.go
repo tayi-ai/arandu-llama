@@ -122,6 +122,7 @@ func Step(ctx context.Context, model Model, cfg StepConfig) (StepReceipt, error)
 	if err != nil {
 		return result, err
 	}
+	result.Objective.Gradient = slices.Clone(result.Objective.Gradient)
 	if !finite(result.Objective.Loss) || !finite(result.Objective.HardLoss) || !finite(result.Objective.FeatureLoss) || len(result.Objective.Gradient) != len(prior) {
 		return result, errors.New("pipeline: objective or gradient geometry differs")
 	}
@@ -140,7 +141,7 @@ func Step(ctx context.Context, model Model, cfg StepConfig) (StepReceipt, error)
 		if err != nil {
 			return result, fmt.Errorf("pipeline: protection linearization: %w", err)
 		}
-		problem.Constraints = append(problem.Constraints, protection.Constraint{ID: pair.ID, Margin: margin.Value, Floor: pair.Floor, Jacobian: margin.Jacobian})
+		problem.Constraints = append(problem.Constraints, protection.Constraint{ID: pair.ID, Margin: margin.Value, Floor: pair.Floor, Jacobian: slices.Clone(margin.Jacobian)})
 		floors = append(floors, protection.Floor{ID: pair.ID, Value: pair.Floor})
 	}
 	result.Solution, err = protection.Solve(ctx, problem, cfg.Solver)
@@ -162,6 +163,7 @@ func Step(ctx context.Context, model Model, cfg StepConfig) (StepReceipt, error)
 			if err != nil {
 				return nil, err
 			}
+			result.CandidateObjective.Gradient = slices.Clone(result.CandidateObjective.Gradient)
 			if !finite(result.CandidateObjective.Loss) || !finite(result.CandidateObjective.HardLoss) || !finite(result.CandidateObjective.FeatureLoss) || result.Objective.Loss-result.CandidateObjective.Loss < cfg.MinimumGain {
 				return nil, errors.New("pipeline: real objective failed the frozen gain requirement")
 			}

@@ -116,3 +116,23 @@ func TestRealObjectiveIncreaseRestoresEvenWhenLinearConstraintsPass(t *testing.T
 		t.Fatalf("objective degradation accepted: %+v %v", r, err)
 	}
 }
+
+type reusedGradientModel struct{ scalarModel }
+
+func (m *reusedGradientModel) Objective(context.Context) (pipeline.Objective, error) {
+	m.gradient[0] = 2
+	return pipeline.Objective{Loss: 1, Gradient: m.gradient}, nil
+}
+func (m *reusedGradientModel) Margin(_ context.Context, _ pipeline.ProtectedPair, _ bool) (pipeline.Margin, error) {
+	m.gradient[0] = 1
+	return pipeline.Margin{Value: float64(m.values[0]), Jacobian: m.gradient}, nil
+}
+func TestBackendBufferReuseCannotChangeCapturedGradient(t *testing.T) {
+	m := &reusedGradientModel{scalarModel{values: []float32{2}, gradient: []float64{2}}}
+	config := stepConfig()
+	config.Protection[0].Floor = -100
+	result, err := pipeline.Step(context.Background(), m, config)
+	if err != nil || m.values[0] != 0 || result.Objective.Gradient[0] != 2 || result.CandidateObjective.Gradient[0] != 2 {
+		t.Fatalf("shared backend buffer changed update: %+v %v", result, err)
+	}
+}
