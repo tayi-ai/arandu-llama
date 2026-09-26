@@ -38,30 +38,17 @@ type TrainingBackend struct {
 // only and must return cleanup; it must not mutate model parameters or identities.
 // This adapter owns neither model nor table lifetime and starts no execution.
 func NewTrainingBackend(loaded *LoadedTextModel, signals *pipeline.Signals, limits Limits, prepare func(context.Context, int) (func() error, error), admission TrainingAdmission) (*TrainingBackend, error) {
-	if loaded == nil || loaded.Model == nil || !signals.Admitted() || signals.Student() != admission.Student || loaded.Summary.Identity != admission.Assembly {
-		return nil, errors.New("pipeline: independently admitted assembly or student differs")
+	if !signals.Admitted() || signals.Student() != admission.Student {
+		return nil, errors.New("pipeline: independently admitted signals differ")
 	}
-	for _, hash := range []string{admission.Assembly.IndexSHA256, admission.Assembly.ConfigSHA256, admission.Assembly.ReferenceSHA256, admission.Assembly.InitialAdapterSHA256} {
-		if !validAssemblyHash(hash) {
-			return nil, errors.New("pipeline: external assembly identity required")
-		}
-	}
-	row := signals.Training()
-	if limits.MaxTokens < int64(len(row.Tokens)) || limits.MaxCheckpointBytes <= 0 || len(loaded.Parameters) == 0 || loaded.Model.Embedding == nil || loaded.Model.Head == nil {
-		return nil, errors.New("pipeline: invalid loaded geometry or training limits")
+	result, err := newTrainingState(loaded, signals.Training(), limits, prepare, admission)
+	if err != nil {
+		return nil, err
 	}
 	embedding, err := loaded.Model.Embedding.Info()
 	if err != nil {
 		return nil, err
 	}
-	head, err := loaded.Model.Head.Info()
-	if err != nil {
-		return nil, err
-	}
-	if len(embedding.Shape) != 2 || embedding.Shape[0] != int64(admission.Student.Vocabulary) || embedding.Shape[1] <= 0 || !slices.Equal(embedding.Shape, head.Shape) {
-		return nil, errors.New("pipeline: loaded vocabulary or hidden width differs")
-	}
-	result := &TrainingBackend{loaded: loaded, training: row, limits: limits, prepareSequence: prepare, admission: admission}
 	for _, teacher := range signals.Teachers() {
 		out := FusionTeacher{Name: teacher.Identity.Name, Weight: teacher.Weight}
 		for _, position := range teacher.Positions {
@@ -79,8 +66,35 @@ func NewTrainingBackend(loaded *LoadedTextModel, signals *pipeline.Signals, limi
 		}
 		result.features = append(result.features, FeatureTarget{Source: feature.Source, Layer: feature.Target.Layer, Position: feature.Position, Weight: feature.Weight, Values: slices.Clone(feature.Values)})
 	}
-	result.admitted = true
 	return result, nil
+}
+
+func newTrainingState(loaded *LoadedTextModel, row pipeline.Example, limits Limits, prepare func(context.Context, int) (func() error, error), admission TrainingAdmission) (*TrainingBackend, error) {
+	if loaded == nil || loaded.Model == nil || loaded.Summary.Identity != admission.Assembly {
+		return nil, errors.New("pipeline: independently admitted assembly or student differs")
+	}
+	for _, hash := range []string{admission.Assembly.IndexSHA256, admission.Assembly.ConfigSHA256, admission.Assembly.ReferenceSHA256, admission.Assembly.InitialAdapterSHA256} {
+		if !validAssemblyHash(hash) {
+			return nil, errors.New("pipeline: external assembly identity required")
+		}
+	}
+	if row.PromptTokens < 1 || row.PromptTokens >= len(row.Tokens) || limits.MaxTokens < int64(len(row.Tokens)) ||
+		limits.LogitRows < int64(len(row.Tokens)-row.PromptTokens+1) || limits.MaxCheckpointBytes <= 0 || len(loaded.Parameters) == 0 || loaded.Model.Embedding == nil || loaded.Model.Head == nil {
+		return nil, errors.New("pipeline: invalid loaded geometry or training limits")
+	}
+	embedding, err := loaded.Model.Embedding.Info()
+	if err != nil {
+		return nil, err
+	}
+	head, err := loaded.Model.Head.Info()
+	if err != nil {
+		return nil, err
+	}
+	if len(embedding.Shape) != 2 || embedding.Shape[0] != int64(admission.Student.Vocabulary) || embedding.Shape[1] <= 0 || !slices.Equal(embedding.Shape, head.Shape) {
+		return nil, errors.New("pipeline: loaded vocabulary or hidden width differs")
+	}
+	row.Tokens = slices.Clone(row.Tokens)
+	return &TrainingBackend{loaded: loaded, training: row, limits: limits, prepareSequence: prepare, admission: admission, admitted: true}, nil
 }
 
 func (m *TrainingBackend) ready() bool {
@@ -110,7 +124,7 @@ func (m *TrainingBackend) Parameters(ctx context.Context) ([]float32, error) {
 
 func (m *TrainingBackend) prepare(ctx context.Context, row pipeline.Example) (Limits, func() error, error) {
 	if ctx == nil || !m.ready() || row.PromptTokens < 1 || row.PromptTokens >= len(row.Tokens) ||
-		int64(len(row.Tokens)) > m.limits.MaxTokens || m.limits.MaxCheckpointBytes <= 0 {
+		int64(len(row.Tokens)) > m.limits.MaxTokens || int64(len(row.Tokens)-row.PromptTokens+1) > m.limits.LogitRows || m.limits.MaxCheckpointBytes <= 0 {
 		return Limits{}, nil, errors.New("pipeline: sequence outside admitted native bounds")
 	}
 	if err := ctx.Err(); err != nil {
