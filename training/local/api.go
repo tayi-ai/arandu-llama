@@ -38,7 +38,7 @@ type Progress struct {
 func (c Config) validate() error {
 	if !filepath.IsAbs(c.BundleDir) || !filepath.IsAbs(c.ModelDir) ||
 		!filepath.IsAbs(c.DataPath) || !filepath.IsAbs(c.CheckpointRoot) ||
-		!filepath.IsAbs(c.InitialCheckpoint) || c.MaxTokens < 2 || c.MaxTokens > 1024 ||
+		!filepath.IsAbs(c.InitialCheckpoint) || c.MaxTokens < 2 || c.MaxTokens > 4096 ||
 		c.MaxSteps < 1 || c.MaxSteps > 20 {
 		return errors.New("local training: absolute paths and bounded work required")
 	}

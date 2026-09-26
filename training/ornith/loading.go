@@ -742,7 +742,7 @@ func wireAssembly(model *TextModel, values map[string]*torch.Tensor, limits Asse
 		}
 		layer.Config = layers.DecoderConfig{Epsilon: 1e-6, MaxInputElements: limits.MaxInputElements,
 			Full:   layers.AttentionConfig{Heads: 16, KVHeads: 4, HeadDimension: 256, RotaryDimension: 64, Epsilon: 1e-6, MaxScoreElements: limits.MaxScoreElements},
-			Linear: layers.LinearAttentionConfig{KeyHeads: 16, ValueHeads: 32, KeyDimension: 128, ValueDimension: 128, Epsilon: 1e-6, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence}}
+			Linear: layers.LinearAttentionConfig{KeyHeads: 16, ValueHeads: 32, KeyDimension: 128, ValueDimension: 128, Epsilon: 1e-6, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence, FrozenWeightsValidated: true}}
 		layer.Weights = layers.DecoderWeights{InputNorm: g("input_layernorm.weight"), PostAttentionNorm: g("post_attention_layernorm.weight"), Gate: g("mlp.gate_proj.weight"), Up: g("mlp.up_proj.weight"), Down: g("mlp.down_proj.weight")}
 		if i%4 == 3 {
 			layer.Weights.Full = &layers.AttentionWeights{Query: g("self_attn.q_proj.base_layer.weight"), Key: g("self_attn.k_proj.weight"), Value: g("self_attn.v_proj.base_layer.weight"), Output: g("self_attn.o_proj.weight"), QueryNorm: g("self_attn.q_norm.weight"), KeyNorm: g("self_attn.k_norm.weight")}
