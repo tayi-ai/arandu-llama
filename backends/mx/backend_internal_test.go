@@ -1,6 +1,8 @@
 package mx
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +61,7 @@ func TestMXGenerateTerminatesAfterOneConversationTurn(t *testing.T) {
 	for i := range endpoints {
 		endpoints[i] = "100.64.0." + decimal(i+2) + ":50052"
 	}
-	process := b.generateProcess("/models/deepseek.gguf", MXGenerateRequest{
+	process := b.generateProcess("/models/example.gguf", MXGenerateRequest{
 		RPCEndpoints: endpoints, Prompt: "TAYI_FLASH_OK", MaxTokens: 1024,
 		Context: 4096, Deadline: time.Hour,
 	})
@@ -70,7 +72,7 @@ func TestMXGenerateTerminatesAfterOneConversationTurn(t *testing.T) {
 }
 
 func TestMXResidentServerIsPrivateBoundAndKeepsAuthenticationOutOfArguments(t *testing.T) {
-	b := &MXBackend{runtimeRoot: "/runtime/mx", modelRoot: t.TempDir()}
+	b := &MXBackend{runtimeRoot: "/runtime/mx", modelRoot: t.TempDir(), model: testModel()}
 	endpoints := make([]string, 20)
 	for i := range endpoints {
 		endpoints[i] = "100.64.0." + decimal(i+2) + ":50052"
@@ -83,11 +85,11 @@ func TestMXResidentServerIsPrivateBoundAndKeepsAuthenticationOutOfArguments(t *t
 			{Path: "/artifacts/probe-minus/adapter.gguf", SHA256: strings.Repeat("b", 64)},
 		},
 	}
-	process := b.serveProcess("/models/deepseek.gguf", request)
+	process := b.serveProcess("/models/example.gguf", request)
 	joined := strings.Join(process.Args, " ")
 	for _, required := range []string{
 		"/runtime/mx/bin/llama-server", "--rpc", "--host 100.64.0.1",
-		"--port 50053", "--alias tayi-flash", "--metrics", "--no-host",
+		"--port 50053", "--alias example-base", "--metrics", "--no-host",
 		"--lora-scaled /artifacts/probe-plus/adapter.gguf:0,/artifacts/probe-minus/adapter.gguf:0",
 	} {
 		if !strings.Contains(joined, required) {
@@ -133,26 +135,17 @@ func decimal(v int) string {
 	return string([]byte{digits[v/10], digits[v%10]})
 }
 
-func TestQ2ModelAdmissionUsesPinnedManifestAndFirstShard(t *testing.T) {
-	const manifest = `0bcee934bd4e8350c54410681d9300b0321a300fcb1df1437a20703394d08ee0  DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf
-124ffa15b6b7ec9630715ad18752a4c3f371749647837b8c9d5f7eb52c4f73c0  DeepSeek-V4.1-Flash-Q2_K-00002-of-00007.gguf
-4dd35b0b086cc0fb19d3a72afd8aed331317950e2257f37b9672702edc3f2453  DeepSeek-V4.1-Flash-Q2_K-00003-of-00007.gguf
-d24832f4c2f42340d5d4bf4d9b3277c861e0a0a9ccd25e94bda5581c5351f960  DeepSeek-V4.1-Flash-Q2_K-00004-of-00007.gguf
-34714c3880bde310207e3d12fa488d8d676f338ff635157fded8ec73e133efad  DeepSeek-V4.1-Flash-Q2_K-00005-of-00007.gguf
-08dc941d26687cb51f736a4f1c3a2c4843fb1d79573164c645106711081f5faf  DeepSeek-V4.1-Flash-Q2_K-00006-of-00007.gguf
-550bbdb94a69142abfa4b2f2db86ffe3dd6d4ca45eafbb6728f4fe40506fa6b9  DeepSeek-V4.1-Flash-Q2_K-00007-of-00007.gguf
-`
-	model, err := admittedMXModel(MXModelQ2K)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestModelAdmissionUsesConfiguredManifestAndFirstShard(t *testing.T) {
+	const manifest = "fixture model manifest\n"
+	model := testModel()
+	model.Manifest = fmt.Sprintf("%x", sha256.Sum256([]byte(manifest)))
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "SHA256SUMS"), []byte(manifest), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	backend := &MXBackend{modelRoot: root, model: model}
 	if _, err := backend.admittedModel(); err == nil || !strings.Contains(err.Error(), "shard is absent") {
-		t.Fatalf("missing Q2 first shard refusal = %v", err)
+		t.Fatalf("missing first shard refusal = %v", err)
 	}
 	first := filepath.Join(root, model.FirstShard)
 	if err := os.WriteFile(first, []byte("GGUF"), 0o600); err != nil {
@@ -160,35 +153,43 @@ d24832f4c2f42340d5d4bf4d9b3277c861e0a0a9ccd25e94bda5581c5351f960  DeepSeek-V4.1-
 	}
 	got, err := backend.admittedModel()
 	if err != nil || got != first {
-		t.Fatalf("pinned Q2 admission = %q, %v", got, err)
+		t.Fatalf("pinned model admission = %q, %v", got, err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "SHA256SUMS"), []byte(manifest+"tampered\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := backend.admittedModel(); err == nil || !strings.Contains(err.Error(), "manifest") {
-		t.Fatalf("mutated Q2 manifest refusal = %v", err)
+		t.Fatalf("mutated manifest refusal = %v", err)
 	}
 }
 
 func TestModelRecipeIsRecoveredOnlyFromPinnedManifestDigest(t *testing.T) {
-	q4 := AdmittedMXManifest()
-	q2, err := AdmittedMXManifestFor(MXModelQ2K)
+	first, second := testModel(), testModel()
+	second.Recipe, second.Manifest = "example-other", strings.Repeat("b", 64)
+	catalog, err := NewMXCatalog([]MXModelIdentity{first, second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		digest string
 		want   MXModelRecipe
-	}{{q4.ModelDigest, MXModelMXFP4}, {q2.ModelDigest, MXModelQ2K}} {
-		got, err := MXModelRecipeForDigest(tc.digest)
+	}{{first.Manifest, first.Recipe}, {second.Manifest, second.Recipe}} {
+		got, err := catalog.RecipeForDigest(tc.digest)
 		if err != nil || got != tc.want {
 			t.Fatalf("recipe for %s = %q, %v; want %q", tc.digest, got, err, tc.want)
 		}
 	}
-	if _, err := MXModelRecipeForDigest(""); err == nil {
+	if _, err := catalog.RecipeForDigest(""); err == nil {
 		t.Fatal("empty model digest was admitted")
 	}
-	if _, err := MXModelRecipeForDigest("not-admitted"); err == nil {
+	if _, err := catalog.RecipeForDigest("not-admitted"); err == nil {
 		t.Fatal("unknown model digest was admitted")
+	}
+}
+
+func testModel() MXModelIdentity {
+	return MXModelIdentity{
+		Recipe: "example-base", Repository: "example/model", Revision: strings.Repeat("a", 40),
+		Quantisation: "Q4_K_M", Manifest: strings.Repeat("a", 64), FirstShard: "model.gguf", Shards: 1,
 	}
 }

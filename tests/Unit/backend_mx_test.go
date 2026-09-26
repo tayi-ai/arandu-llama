@@ -1,13 +1,29 @@
 package unit_test
 
 import (
+	"strings"
 	"testing"
 
 	mx "github.com/tayi-ai/arandu-llama/backends/mx"
 )
 
-func TestMXManifestKeepsTheQualifiedBuildIdentity(t *testing.T) {
-	m := mx.AdmittedMXManifest()
+func mxIdentity() mx.MXModelIdentity {
+	return mx.MXModelIdentity{
+		Recipe: "example-base", Repository: "example/model", Revision: strings.Repeat("a", 40),
+		Quantisation: "Q4_K_M", Manifest: strings.Repeat("b", 64), FirstShard: "model.gguf", Shards: 1,
+	}
+}
+
+func TestMXCatalogKeepsTheQualifiedBuildIdentity(t *testing.T) {
+	model := mxIdentity()
+	catalog, err := mx.NewMXCatalog([]mx.MXModelIdentity{model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := catalog.ManifestFor(model.Recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m.Backend != mx.MXBackendID || m.Revision != "a245214d8df6304762c7688c6b8ee45652c5c8e5" {
 		t.Fatalf("unexpected MX identity: %+v", m)
 	}
@@ -22,28 +38,105 @@ func TestMXManifestKeepsTheQualifiedBuildIdentity(t *testing.T) {
 	}
 }
 
-func TestMXManifestPinsQ2SeparatelyWithoutChangingTheQ4Default(t *testing.T) {
-	q4 := mx.AdmittedMXManifest()
-	q2, err := mx.AdmittedMXManifestFor(mx.MXModelQ2K)
+func TestMXCatalogSelectsIndependentModelsWithoutImplicitDefaults(t *testing.T) {
+	first, second := mxIdentity(), mxIdentity()
+	second.Recipe, second.Repository = "example-second", "other/model"
+	second.Revision, second.Manifest = strings.Repeat("c", 64), strings.Repeat("d", 64)
+	second.Quantisation, second.FirstShard, second.Shards = "Q6_K", "part-00001-of-00002.gguf", 2
+	entries := []mx.MXModelIdentity{first, second}
+	catalog, err := mx.NewMXCatalog(entries)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if q4.ModelRecipe != mx.MXModelMXFP4 || q4.ModelShards != 12 || q4.ModelQuantisation != "MXFP4" {
-		t.Fatalf("Q4 default drifted: %+v", q4)
+	entries[0] = second
+	for _, want := range []mx.MXModelIdentity{first, second} {
+		got, err := catalog.ModelFor(want.Recipe)
+		if err != nil || got != want {
+			t.Fatalf("selected identity = %+v, %v; want %+v", got, err, want)
+		}
+		manifest, err := catalog.ManifestFor(want.Recipe)
+		if err != nil || manifest.ModelDigest != want.Manifest || manifest.ModelRevision != want.Revision || manifest.ModelRepository != want.Repository || manifest.ModelFirstShard != want.FirstShard || manifest.ModelShards != want.Shards || manifest.ModelQuantisation != want.Quantisation {
+			t.Fatalf("selected manifest = %+v, %v", manifest, err)
+		}
+		recipe, err := catalog.RecipeForDigest(want.Manifest)
+		if err != nil || recipe != want.Recipe {
+			t.Fatalf("persisted digest selected %q, %v", recipe, err)
+		}
+		// A caller owns its returned maps and values, never the catalog state.
+		manifest.Binaries["llama-cli"] = "changed"
+		manifest.RuntimeEnvironment["GGML_CUDA_Q8_1_CACHE"] = "1"
+		got.Manifest = "changed"
+		again, err := catalog.ManifestFor(want.Recipe)
+		if err != nil || again.ModelDigest != want.Manifest || again.Binaries["llama-cli"] == "changed" || again.RuntimeEnvironment["GGML_CUDA_Q8_1_CACHE"] != "0" {
+			t.Fatalf("catalog identity changed through output: %+v, %v", again, err)
+		}
 	}
-	if q2.ModelRecipe != mx.MXModelQ2K || q2.ModelShards != 7 || q2.ModelQuantisation != "Q2_K" {
-		t.Fatalf("Q2 recipe is incomplete: %+v", q2)
+	for _, invalid := range []mx.MXModelRecipe{"", "unknown", "example-base "} {
+		if _, err := catalog.ManifestFor(invalid); err == nil {
+			t.Fatalf("unadmitted selector %q chose a model", invalid)
+		}
 	}
-	if q2.ModelRevision != "58d8ac86298fdf85a2440defee08b1abcad32e45" || q2.ModelDigest != "676c159423ab746ba1ce6036f072d84d977921276429927f336f58aefaea9999" {
-		t.Fatalf("Q2 source identity drifted: %+v", q2)
+	if _, err := catalog.RecipeForDigest(strings.Repeat("e", 64)); err == nil {
+		t.Fatal("unknown persisted digest chose a model")
 	}
-	if _, err := mx.AdmittedMXManifestFor(mx.MXModelRecipe("q2-by-name-only")); err == nil {
-		t.Fatal("an unpinned Q2 recipe was accepted")
+	for _, empty := range []*mx.MXCatalog{nil, {}} {
+		if _, err := empty.ModelFor(first.Recipe); err == nil {
+			t.Fatal("empty catalog selected a model")
+		}
+		if _, err := empty.RecipeForDigest(first.Manifest); err == nil {
+			t.Fatal("empty catalog resolved a digest")
+		}
+	}
+}
+
+func TestMXCatalogRejectsMalformedAndAmbiguousIdentities(t *testing.T) {
+	changes := map[string]func(*mx.MXModelIdentity){
+		"missing recipe":        func(m *mx.MXModelIdentity) { m.Recipe = "" },
+		"option selector":       func(m *mx.MXModelIdentity) { m.Recipe = "--help" },
+		"blank repository":      func(m *mx.MXModelIdentity) { m.Repository = "" },
+		"repository whitespace": func(m *mx.MXModelIdentity) { m.Repository = "org/model\n" },
+		"mutable revision":      func(m *mx.MXModelIdentity) { m.Revision = "main" },
+		"uppercase revision":    func(m *mx.MXModelIdentity) { m.Revision = strings.Repeat("A", 40) },
+		"zero revision":         func(m *mx.MXModelIdentity) { m.Revision = strings.Repeat("0", 40) },
+		"missing manifest":      func(m *mx.MXModelIdentity) { m.Manifest = "" },
+		"nonhex manifest":       func(m *mx.MXModelIdentity) { m.Manifest = strings.Repeat("z", 64) },
+		"blank quantisation":    func(m *mx.MXModelIdentity) { m.Quantisation = "" },
+		"shard traversal":       func(m *mx.MXModelIdentity) { m.FirstShard = "../model.gguf" },
+		"absolute shard":        func(m *mx.MXModelIdentity) { m.FirstShard = "/model.gguf" },
+		"shard separator":       func(m *mx.MXModelIdentity) { m.FirstShard = "a,model.gguf" },
+		"empty shards":          func(m *mx.MXModelIdentity) { m.Shards = 0 },
+		"unbounded shards":      func(m *mx.MXModelIdentity) { m.Shards = 100000 },
+	}
+	for name, change := range changes {
+		t.Run(name, func(t *testing.T) {
+			model := mxIdentity()
+			change(&model)
+			if _, err := mx.NewMXCatalog([]mx.MXModelIdentity{model}); err == nil {
+				t.Fatal("malformed identity was admitted")
+			}
+			if _, err := mx.NewMXBackend(mx.MXConfig{RuntimeRoot: t.TempDir(), ModelRoot: t.TempDir(), Model: model}); err == nil {
+				t.Fatal("malformed backend identity was admitted")
+			}
+		})
+	}
+	if _, err := mx.NewMXCatalog(nil); err == nil {
+		t.Fatal("empty catalog was admitted")
+	}
+	first, second := mxIdentity(), mxIdentity()
+	if _, err := mx.NewMXCatalog([]mx.MXModelIdentity{first, second}); err == nil {
+		t.Fatal("duplicate recipe was admitted")
+	}
+	second.Recipe = "example-second"
+	if _, err := mx.NewMXCatalog([]mx.MXModelIdentity{first, second}); err == nil {
+		t.Fatal("ambiguous persisted model digest was admitted")
 	}
 }
 
 func TestMXBackendRefusesUnverifiedInstallation(t *testing.T) {
-	if _, err := mx.NewMXBackend(mx.MXConfig{RuntimeRoot: t.TempDir(), ModelRoot: t.TempDir()}); err == nil {
+	if _, err := mx.NewMXBackend(mx.MXConfig{RuntimeRoot: t.TempDir(), ModelRoot: t.TempDir(), Model: mxIdentity()}); err == nil {
 		t.Fatal("unverified runtime was accepted")
+	}
+	if _, err := mx.NewMXBackend(mx.MXConfig{RuntimeRoot: t.TempDir(), ModelRoot: t.TempDir()}); err == nil {
+		t.Fatal("absent model identity selected an implicit default")
 	}
 }
